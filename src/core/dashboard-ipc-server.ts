@@ -97,6 +97,7 @@ import {
 } from '../cli/current-actor.js';
 import { CURRENT_EXECUTION_ROUTE, CURRENT_EXECUTION_SCHEMA } from '../cli/current-execution.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
+import { projectTriggerInputCommit } from './trigger-input-commit.js';
 import {
   attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
@@ -3875,7 +3876,13 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   // Four-state semantics: the query itself succeeds (HTTP 200) for every
   // resolved state including not_found — task state lives in `result.state`,
   // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
-  jsonRes(res, result.ok ? 200 : 400, result);
+  let inputCommitted: ReturnType<typeof projectTriggerInputCommit> = { schemaVersion: 1, state: 'unknown' };
+  try {
+    inputCommitted = projectTriggerInputCommit({ ownerLarkAppId: cachedLarkAppId,
+      sessionId: params.sessionId, triggerId, session: findOwnedSessionRecord(params.sessionId),
+      persisted: triggerId ? asyncTriggerStore.lookupStrict(params.sessionId, triggerId) : undefined, result });
+  } catch { /* Missing/corrupt evidence cannot prove acceptance or change the result. */ }
+  jsonRes(res, result.ok ? 200 : 400, { ...result, inputCommitted });
 });
 
 /**
