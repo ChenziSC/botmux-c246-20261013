@@ -193,13 +193,30 @@ try:
         evidence=registration['evidence']
         assert evidence['status']==200 and evidence['body']['inputCommitted']['state']=='observed',evidence
     checks.append('response loss plus duplicate callbacks: one native input commit and one successor per original session')
+    wait_for('answer turns terminal', lambda:(root/'host-2.log').read_text(), lambda log:log.count('(turn_terminal)')==3)
+    for case,kind in [('topic','p2p'),('group_a','group'),('group_b','group')]:
+        followup=message(case,kind)
+        followup['event']['message']['message_id']='om_fixture_followup_'+case
+        if kind=='p2p':
+            followup['event']['message']['root_id']='om_fixture_topic'
+            followup['event']['message']['thread_id']='omt_fixture_topic'
+        request('/event',followup)
+    def proofs():
+        return [json.loads(x) for x in (root/'execution-proofs.jsonl').read_text().splitlines()]
+    observed=wait_for('current execution on subsequent turns of persistent engines',proofs,lambda values:len(values)==9)
+    assert all(p['code']==0 and json.loads(p['stdout'])['status']=='verified' for p in observed),observed
+    assert all(json.loads(p['stdout'])['sessionId']==p['sessionId'] for p in observed)
+    counts=collections.Counter(t['params']['threadId'] for t in turns())
+    assert set(counts.values())=={3} and len(counts)==3,counts
+    checks.append('real execution current succeeds on opening, restored and subsequent persistent-engine turns')
+    wait_for('followup turns terminal', lambda:(root/'host-2.log').read_text(), lambda log:log.count('(turn_terminal)')==6)
     stop()
     start()
     settled=wait_for('committed answers remain settled after second cold restart',state,
                      lambda s:len(s['waits'])==3 and all(w.get('continuation',{}).get('state')=='committed' for w in s['waits']))
     for event in events: request('/event',event)
     time.sleep(2)
-    assert len(turns())==6
+    assert len(turns())==9
     checks.append('post-commit cold restart and replay do not execute answers again')
     result.update(status='passed',initial=initial,final=final,settled=settled,turnCounts=dict(counts))
 except BaseException as error:
