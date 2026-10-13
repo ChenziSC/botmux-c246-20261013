@@ -38,3 +38,13 @@ python3 src/core/__tests__/fixtures/ask-runtime/run.py --node /absolute/path/to/
 需要 Linux、bubblewrap、Node 22+ 和已安装依赖。脚本保持原 HOME 值，通过独立文件系统映射隔离机器人数据、缓存和模型配置；仅输出临时证据目录。可用 `--repo` 指定另一个精确构建目录，用 `--output` 保存结果。
 
 进程回归只替换外部 IM 传输与模型。它不直接制造 registration/inputCommitted 或写成功回执，也不调用测试 reset 模拟重启。它证明运行时链路，不代替真实飞书网络、实际模型输出、平台业务收集或完整业务交付验收。
+
+## Codex App 后继轮次的执行身份证明
+
+进程组合回归发现，平台发布确认问题的下一轮执行会被 `execution current` 拒绝。Worker 原来只登记 runner PID；常驻 app-server 已存在于下一轮的进程快照中，合法工具的祖先链因此触发旧工具防护。该问题与 Ask 回调、平台业务决策人和超时无关。
+
+runner 在 `initialize` 握手后、`thread/start`/`resume` 前捕获自身与实际 app-server 的 PID/启动时间，通过既有签名控制通道提交 `process_attestation` 并等待 ACK。npm 安装的常驻 launcher 使用原有原生进程发现逻辑解析实际 app-server；Worker 独立验证启动时间、祖先关系和当前 backend 所属。沙箱 PID 按内核 NSpid 与启动时间映射，限定在当前 backend 后代且拒绝歧义。该路径只在 Linux 发布进程证明，其他平台和其他 CLI 保持原有行为。
+
+Worker 将证明通过私有 IPC 纳入已有 engine 根。停止控制代时撤销，重新连接或 app-server 重启重新证明；复用旧 PID 不能更新旧证明的启动身份。新增根不重拍当前在途轮次的旧进程快照。原有 generation、socket peer、旧工具及其后代的拒绝条件保持生效。
+
+新增验证包括旧 app-server 导致的拒绝反例、合法第二轮、旧工具及其子进程拒绝、启动身份变更、错误 backend、npm launcher 以及真实嵌套 PID namespace。进程回归在三个会话各执行首次、冷恢复、同一常驻引擎后继轮次的真实 `execution current`，核对每个原 thread 共三次 turn/start，仍保留两次冷重启与答案回调去重检查。外部 IM 与模型由确定性替身提供，不能将此项等同于平台或真实模型业务验收。

@@ -71,6 +71,7 @@ import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
+import { verifyCodexAppProcessAttestation, type CodexAppProcessAttestation } from './utils/codex-app-process-attestation.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
@@ -4146,6 +4147,7 @@ let codexAppCompletionAwaitingFinal = false;
 let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
+let codexAppProcessAttestation: CodexAppProcessAttestation | undefined;
 /** Authentication proves identity, not app-server readiness. These become true
  * only after the active generation publishes a valid signed state marker. */
 let codexAppSignedStateObserved = false;
@@ -4240,6 +4242,10 @@ function stopCodexAppControlChannel(
   opts: { preserveDispatchRecovery?: boolean } = {},
 ): void {
   codexAppControlStopping = true;
+  if (codexAppProcessAttestation) {
+    codexAppProcessAttestation = undefined;
+    publishLocalProcessAttestation(undefined, undefined, false);
+  }
   // Attribution belongs to exactly one worker/control generation.  A fresh or
   // replacement worker may recover only the daemon-frozen active identity
   // after the old runner proves a warm reattach; stale queued entries must not
@@ -11621,6 +11627,21 @@ async function handleTrustedCodexAppMarker(
       appTurnId: event.appTurnId,
       turnId: event.replyTurnId,
     });
+    return true;
+  }
+
+  if (kind === 'process_attestation' && isCodexAppCliId(lastInitConfig?.cliId)) {
+    const proof = process.platform === 'linux'
+      ? verifyCodexAppProcessAttestation(payload, currentCodexObservedPid())
+      : undefined;
+    if (!proof) {
+      failCodexAppControlGeneration('Codex App runner process attestation did not match its live process tree');
+      return false;
+    }
+    codexAppProcessAttestation = proof;
+    // Add the authenticated engine root without re-snapshotting a running
+    // turn. Otherwise warm reconnects would classify its active tools as old.
+    publishLocalProcessAttestation(currentCodexObservedPid(), proof.enginePid, false);
     return true;
   }
 
@@ -23305,10 +23326,13 @@ function rejectOrdinaryImTurn(
 
 function publishLocalProcessAttestation(
   cliPid?: number,
-  enginePid = codexRpcEngine?.appServerPid,
+  enginePid = codexRpcEngine?.appServerPid ?? codexAppProcessAttestation?.enginePid,
+  refreshTurnSnapshot = true,
 ): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
-  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  const engineProcStart = enginePid === codexAppProcessAttestation?.enginePid
+    ? codexAppProcessAttestation?.engineProcStart
+    : enginePid ? readProcessStartIdentity(enginePid) : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
@@ -23322,7 +23346,7 @@ function publishLocalProcessAttestation(
   // before it snapshots the current turn's pre-existing descendants. This is
   // required for the opening turn, whose origin is first published before the
   // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
-  if (currentBotmuxTurnId) publishSandboxRelayCapability();
+  if (refreshTurnSnapshot && currentBotmuxTurnId) publishSandboxRelayCapability();
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`
