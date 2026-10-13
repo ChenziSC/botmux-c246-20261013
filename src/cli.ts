@@ -6956,6 +6956,7 @@ ${SEND_HELP_BODY}
   quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
+  ask buttons --host-wait [--request-id <key>]  宿主持久等待；只返回登记回执，答案续接原会话
   ask buttons --questions-file <file>   多题卡片，支持 defaultSelectedKeys 预选；底部提交，返回 JSON
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
@@ -14731,8 +14732,7 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
  *     runHook 会重连重试。确定性 4xx（bad body / capability 拒绝 / unsupported)
  *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
-async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
-  type AskResult = import('./core/ask-types.js').AskResult;
+async function postAsk<T = import('./core/ask-types.js').AskResult>(body: Record<string, unknown>): Promise<T> {
   type AskError = Error & { exitCode: number; retryable: boolean };
   const mkErr = (message: string, retryable: boolean): AskError =>
     Object.assign(new Error(message), { exitCode: 3, retryable });
@@ -14791,7 +14791,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   }
 
   try {
-    return (await res.json()) as AskResult;
+    return (await res.json()) as T;
   } catch (jsonErr) {
     // A malformed body is not something a retry fixes.
     throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
@@ -14845,7 +14845,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const timeoutRaw = argValue(rest, '--timeout');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
-  const positionalArgs = positionals(rest, ['--json', '--multi']);
+  const hostWait = rest.includes('--host-wait') || process.env.BOTMUX_ASK_DELIVERY_MODE === 'continuation';
+  const positionalArgs = positionals(rest, ['--json', '--multi', '--host-wait']);
 
   let options;
   let questions;
@@ -14908,6 +14909,18 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
   };
+
+  if (hostWait) {
+    if (!liveAskOrigin?.turnId) throw new Error('botmux ask: host wait requires a verified active turn');
+    const { createHash } = await import('node:crypto');
+    const requestId = argValue(rest, '--request-id') ?? createHash('sha256')
+      .update(JSON.stringify([askSessionId, liveAskOrigin.turnId, questions ?? [{ prompt, options, multiSelect }]])).digest('hex');
+    const registered = await postAsk<import('./core/ask-types.js').AskWaitRegistration>({ ...body, requestId, deliveryMode: 'continuation' });
+    if (registered.ok !== true || registered.deliveryMode !== 'continuation' || registered.sessionId !== askSessionId || registered.requestId !== requestId)
+      throw new Error('botmux ask: host wait registration unproven');
+    process.stdout.write(JSON.stringify(registered) + '\n');
+    return;
+  }
 
   const protectAskWait = () => {
     console.error('botmux ask: 正在等待真人回答；Ctrl-C 不取消确认，请等待回答或正常超时。');

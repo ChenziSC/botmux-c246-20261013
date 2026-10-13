@@ -89,12 +89,34 @@ export interface AskJsonOutput {
   timedOut: boolean;
 }
 
+/** Host-bound wait: stdout acknowledges registration only. The daemon is the
+ * sole answer consumer and retains responsibility until a keyed input commits. */
+export interface AskContinuation {
+  originTurnId: string;
+  originDispatchAttempt?: number;
+  state: 'waiting' | 'answer_received' | 'accepted' | 'committed' | 'blocked';
+  key?: string;
+  nextObserveAt?: number;
+  triggerId?: string;
+  reason?: string;
+}
+export interface AskWaitRegistration {
+  ok: true;
+  state: 'waiting_for_user' | 'answer_received' | 'accepted' | 'committed' | 'blocked';
+  askId: string;
+  requestId: string;
+  sessionId: string;
+  deliveryMode: 'continuation';
+}
+
 /** Input accepted by broker.registerAsk. Caller (CLI subcommand → daemon IPC
  *  handler) is responsible for env validation and parameter parsing. Click
  *  authorization is the bot's canTalk gate, injected via `setCanTalkChecker`.
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
+  /** Daemon-computed; never accepted from an unverified request body. */
+  continuation?: AskContinuation;
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
   replyCardTarget?: { turnId: string; dispatchAttempt?: number;
     /** Frozen by authenticated daemon admission; never accepted from CLI JSON. */
@@ -142,6 +164,7 @@ export interface CreateAskInput {
  *
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
+  continuation?: AskContinuation;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   result?: AskResult;
   askId: string;
