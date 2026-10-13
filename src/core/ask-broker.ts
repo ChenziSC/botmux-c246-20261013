@@ -1311,3 +1311,16 @@ export function listAskContinuations(): Array<{ askId: string; sessionId: string
   return [...pending.values()].filter(ask => ask.continuation).map(ask => ({ askId: ask.askId,
     sessionId: ask.sessionId, continuation: { ...ask.continuation! } }));
 }
+
+/** Host-only source evidence for a durable native wait. Reading never claims an
+ * answer, mutates its continuation or substitutes another question in a session. */
+export function readContinuationAskFact(identity: { larkAppId: string; sessionId: string; requestId: string; askId: string }) {
+  const ask = pending.get(identity.askId);
+  if (!ask?.continuation || ask.originKind !== 'host_wait' || ask.larkAppId !== identity.larkAppId
+    || ask.sessionId !== identity.sessionId || ask.requestId !== identity.requestId) return null;
+  return structuredClone({ askId: ask.askId, requestId: ask.requestId, larkAppId: ask.larkAppId,
+    sessionId: ask.sessionId, chatId: ask.chatId, rootMessageId: ask.rootMessageId,
+    questions: ask.questions, answererOpenId: ask.answererOpenId,
+    cardMessageId: ask.cardMessageId, createdAt: ask.createdAt, answeredAt: ask.settledAt,
+    result: ask.answeredResult ?? ask.terminalResult, continuation: ask.continuation });
+}

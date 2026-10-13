@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { _resetForTest, _getPending, setCardDispatcher, setCanTalkChecker, setAskPersistStore,
   registerContinuationAsk, reconcileAskContinuations, listAskContinuations, tryResolveAsk,
-  restorePersistedAsks, invalidateAll } from '../ask-broker.js';
+  restorePersistedAsks, invalidateAll, readContinuationAskFact } from '../ask-broker.js';
 import { createAskPersistStore } from '../ask-persist-store.js';
 import { createAskContinuationDispatcher, continuationRequest } from '../ask-continuation.js';
 import { parseAskBody } from '../ask-api.js';
@@ -115,4 +115,18 @@ it.each(['group', 'p2p'] as const)('preserves the source chat permission for %s 
     expect(continuationRequest(data).options?.allowChatMessages).toBe(chatType === 'group');
     return { state: 'committed' };
   });
+});
+
+it('reads only the exact original durable Ask and retains its answer across read and restore', async () => {
+  const registration=registerContinuationAsk(input); await Promise.resolve(); answer(registration.askId);
+  const identity={larkAppId:input.larkAppId,sessionId:input.sessionId,requestId:input.requestId!,askId:registration.askId};
+  const first=readContinuationAskFact(identity)!;
+  expect(first.result).toMatchObject({kind:'answered',answers:[['yes']],by:'owner'});
+  expect(first.questions).toEqual(input.questions); expect(first).not.toHaveProperty('nonce');
+  for(const field of ['larkAppId','sessionId','requestId','askId']) expect(readContinuationAskFact({...identity,[field]:'other'})).toBeNull();
+  first.questions[0].prompt='caller mutated its copy';
+  _resetForTest();boot();restorePersistedAsks(Date.now(),'app');
+  expect(readContinuationAskFact(identity)?.questions).toEqual(input.questions);
+  expect(readContinuationAskFact(identity)?.result).toEqual(first.result);
+  expect(store.list()).toHaveLength(1); expect(cards).toBe(1);
 });
