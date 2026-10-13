@@ -6854,6 +6854,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               --plain  纯文本表格输出（管道/脚本场景）
   observe [--session <id>] [--lark-app <appId>] [--include-raw]
               通过 daemon 实时 IPC 输出 canonical worker/session JSON；失败保持 unknown，不回退缓存
+  ask-fact --bot <appId> --session <id> --request <id> --ask <id>  宿主回读原生持久问题原件
   interaction-context --bot <appId> --session <id> [--actor <openId>]
               宿主只读查询真实会话来源及当前回答权限（不恢复会话）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -17828,6 +17829,24 @@ switch (command) {
     } catch (error) {
       console.error(`botmux interaction-context: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
+    }
+    break;
+  }
+  case 'ask-fact': {
+    try {
+      if (process.env.BOTMUX_SEND_RELAY || findAncestorSessionId()) throw new Error('Host context required');
+      const { parseAskFactCommand } = await import('./cli/ask-fact.js');
+      const command = parseAskFactCommand(process.argv.slice(3));
+      const daemon = findDaemon(command.identity.larkAppId);
+      if (!daemon) throw new Error('Bot daemon is unavailable');
+      const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
+        { method: 'GET', signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
+      const body = await response.json() as Record<string, unknown>;
+      if (response.ok && (body.ok !== true || body.schemaVersion !== 1
+        || Object.entries(command.identity).some(([key,value]) => body[key] !== value))) throw new Error('Ask observation identity mismatch');
+      console.log(JSON.stringify(body)); if (!response.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(`botmux ask-fact: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1;
     }
     break;
   }

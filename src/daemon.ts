@@ -1,4 +1,4 @@
-import { registerContinuationAsk, reconcileAskContinuations, listAskContinuations } from './core/ask-broker.js';
+import { registerContinuationAsk, reconcileAskContinuations, listAskContinuations, readContinuationAskFact } from './core/ask-broker.js';
 import { createAskContinuationDispatcher } from './core/ask-continuation.js';
 import { readTurnRegistration } from './core/trigger-registration.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
@@ -7869,6 +7869,16 @@ const explicitAskContinuation = createExplicitAskContinuation({
     return result.ok && result.action !== 'ignored';
   },
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
+});
+ipcRoute('GET', '/api/asks/fact', (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'host_context_required' });
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const identity = { larkAppId: query.get('larkAppId') ?? '', sessionId: query.get('sessionId') ?? '',
+    requestId: query.get('requestId') ?? '', askId: query.get('askId') ?? '' };
+  if (Object.values(identity).some(value => !value || value.length > 200 || /[\u0000-\u001f\u007f]/.test(value)))
+    return jsonRes(res, 400, { ok: false, error: 'bad_ask_identity' });
+  const question = readContinuationAskFact(identity);
+  return jsonRes(res, 200, { ok: true, schemaVersion: 1, ...identity, state: question ? 'observed' : 'unknown', question });
 });
 ipcRoute('GET', '/api/asks/continuations', (_req, res) => jsonRes(res, 200, { ok: true, waits: listAskContinuations() }));
 
