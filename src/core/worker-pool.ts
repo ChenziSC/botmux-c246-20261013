@@ -14467,6 +14467,15 @@ function setupWorkerHandlers(
         // that HTTP terminal and its failed UI closed to late/repeated ACKs.
         if (ds.settledHttpTerminalTurns?.has(msg.turnId)) break;
         ds.failedIdleTurnId = undefined;
+        if (ds.asyncTriggerResults?.has(msg.turnId)) {
+          try {
+            asyncTriggerStore.recordInputCommit(ds.session.sessionId, msg.turnId, ds.larkAppId, workerGeneration);
+          } catch {
+            // Keep lifecycle/result handling intact; the public observer must
+            // retain unknown until the original evidence can be proven.
+            logger.warn('Could not persist async trigger input-commit observation');
+          }
+        }
         const registeredTurn = ds.idempotentAsyncTurns?.get(msg.turnId);
         if (registeredTurn?.kind === 'turn'
           && registeredTurn.ownerLarkAppId === ds.larkAppId
