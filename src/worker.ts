@@ -327,7 +327,7 @@ import {
   upgradeRequired, waitForCodexExit,
   type CodexExecutable, type CodexProcess,
 } from './services/codex-session-upgrade.js';
-import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
+import { buildWrappedLaunch, collectCodexConfigOverrides, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
 import { buildForgeTraexLaunch, validateCliLaunchModeConfig } from './core/cli-launch-mode.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import {
@@ -17550,6 +17550,7 @@ async function spawnCli(
   if (cliAdapter.allowExtraArgs === false && (process.env.CLI_EXTRA_ARGS ?? '').trim()) {
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
+  const codexConfigOverrides = cfg.cliId === 'codex' ? collectCodexConfigOverrides(args) : undefined;
   if (cliExtraArgs.length) args.push(...cliExtraArgs);
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
@@ -18895,6 +18896,7 @@ async function spawnCli(
     log(`mojo extra CLI args deferred to per-turn append: ${spawnArgs.join(' ')}`);
     spawnArgs = [];
   }
+  let reproduceWrappedLaunch: { bin: string; args: string[] } | undefined;
   if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
     if (sandboxRequested) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with the sandbox wrapper)`);
@@ -18920,9 +18922,10 @@ async function spawnCli(
           if (!process.env.SESSION_DATA_DIR) throw new Error('SESSION_DATA_DIR is unavailable');
           aidenCodexShimDir = installAidenCodexShim(
             join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
+            codexConfigOverrides,
           );
         } catch (e) {
-          log(`[aiden-codex] WARN reasoning shim unavailable; using Aiden default effort: ${(e as Error).message}`);
+          throw new Error(`Aiden Codex launch shim unavailable: ${(e as Error).message}`);
         }
       }
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
@@ -18930,9 +18933,11 @@ async function spawnCli(
         childPath: effectiveChildEnv.PATH,
         aidenCodexRealBin: cliAdapter.resolvedBin,
         aidenCodexShimDir,
+        codexConfigOverrides,
         pathDelimiter: delimiter,
       });
       if (launch.bin) {
+        reproduceWrappedLaunch = { bin: launch.bin, args: [...launch.args] };
         spawnBin = launch.bin;
         spawnArgs = launch.args;
         if (launch.env) Object.assign(childEnv as Record<string, string>, launch.env);
@@ -19157,7 +19162,7 @@ async function spawnCli(
   // bin/args 取 sandbox 包装前的快照，最终形态（含/不含 wrapperCli）由
   // selectReproduceLaunch 决策——绝不含 sandbox-exec/bwrap 外层。riff 返回 null。
   try {
-    const reproduceLaunch = selectReproduceLaunch({
+    const reproduceLaunch = reproduceWrappedLaunch ?? selectReproduceLaunch({
       baseBin: reproduceBaseBin,
       baseArgs: reproduceBaseArgs,
       wrapperCli: cfg.wrapperCli,

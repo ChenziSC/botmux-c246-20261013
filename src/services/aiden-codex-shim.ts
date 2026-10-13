@@ -5,33 +5,40 @@ import { CODEX_REASONING_EFFORTS } from './codex-reasoning-effort.js';
 
 const SHIM_NAME = 'codex';
 
-export function renderAidenCodexShim(): string {
+export function renderAidenCodexShim(configOverrides?: ReadonlyArray<string>): string {
   const allowed = CODEX_REASONING_EFFORTS.join('|');
+  // These values come only from the adapter, never user/provider extra args.
+  // Quote as shell literals, including quotes, newlines, $, and backticks in paths.
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
   return [
     '#!/bin/sh',
     'set -eu',
     '',
     'real_bin=${BOTMUX_AIDEN_CODEX_REAL_BIN:-}',
-    'effort=${BOTMUX_AIDEN_CODEX_REASONING_EFFORT:-}',
-    `case "$effort" in ${allowed}) ;;`,
-    '  *) echo "botmux aiden-codex shim: missing launch configuration" >&2; exit 1 ;;',
-    'esac',
+    ...(configOverrides === undefined ? [
+      'effort=${BOTMUX_AIDEN_CODEX_REASONING_EFFORT:-}',
+      `case "$effort" in ${allowed}) ;;`,
+      '  *) echo "botmux aiden-codex shim: missing launch configuration" >&2; exit 1 ;;',
+      'esac',
+    ] : []),
     'if [ -z "$real_bin" ] || [ ! -x "$real_bin" ]; then',
     '  echo "botmux aiden-codex shim: real codex executable is unavailable" >&2',
     '  exit 1',
     'fi',
     'if [ -n "${BOTMUX_AIDEN_CODEX_PARENT_PATH:-}" ]; then export PATH="$BOTMUX_AIDEN_CODEX_PARENT_PATH"; fi',
     'unset BOTMUX_AIDEN_CODEX_REAL_BIN BOTMUX_AIDEN_CODEX_REASONING_EFFORT BOTMUX_AIDEN_CODEX_PARENT_PATH',
-    'exec "$real_bin" -c "model_reasoning_effort=\\\"$effort\\\"" "$@"',
+    configOverrides === undefined
+      ? 'exec "$real_bin" -c "model_reasoning_effort=\\\"$effort\\\"" "$@"'
+      : `exec "$real_bin" ${configOverrides.map(value => `-c ${quote(value)}`).join(' ')} "$@"`,
     '',
   ].join('\n');
 }
 
 /** Materialize the PATH shim outside Bun's virtual /$bunfs filesystem. */
-export function installAidenCodexShim(binDir: string): string {
+export function installAidenCodexShim(binDir: string, configOverrides?: ReadonlyArray<string>): string {
   mkdirSync(binDir, { recursive: true, mode: 0o700 });
   const path = join(binDir, SHIM_NAME);
-  atomicWriteFileSync(path, renderAidenCodexShim(), { mode: 0o755 });
+  atomicWriteFileSync(path, renderAidenCodexShim(configOverrides), { mode: 0o700 });
   accessSync(path, constants.X_OK);
   // Run after the pane shell has loaded its PATH. childEnv.PATH is deliberately
   // not transported by tmux/zellij, so prepending it in the worker is ineffective.

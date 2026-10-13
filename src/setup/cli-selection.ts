@@ -8,7 +8,7 @@
  *   - CJADK × Claude → 底层 cliId=claude-code，启动前缀 `cjadk claude`
  *   - CJADK × Codex  → 底层 cliId=codex，启动前缀 `cjadk codex`
  *
- * 这些形态**不生成任何 wrapper 脚本**：通过 bot 配置的 `wrapperCli`（通用启动前缀）
+ * 这些形态通过 bot 配置的 `wrapperCli`（通用启动前缀）
  * 实现——worker 在 spawn 时把启动命令拼成 `<wrapperCli> <CLI 参数>`（纯 argv，跨系统）。
  * `wrapperCli` 是通用机制（也能承载 ccr / claude-w 等），不止 aiden / cjadk。见 worker.ts 的
  * wrapperCli 处理与 {@link buildWrappedLaunch} / {@link stripSettingsArgs}。
@@ -330,7 +330,46 @@ function isCjadkWrapper(tokens: ReadonlyArray<string>): boolean {
   return tokens[0] === 'cjadk';
 }
 
-/** 是否为 botmux 自己给 Codex 注入的 config 覆盖。精确白名单避免误伤用户自带的
+/** Snapshot only the Codex adapter's output, BEFORE user extra args are appended.
+ * Ownership comes from the producer, not config names: tool identity also uses
+ * SESSION_DATA_DIR, BASH_ENV, etc., and future adapter configs need the same route.
+ */
+export function collectCodexConfigOverrides(adapterArgs: ReadonlyArray<string>): string[] {
+  const overrides: string[] = [];
+  for (let i = 0; i < adapterArgs.length; i++) {
+    if (adapterArgs[i] === '-c' || adapterArgs[i] === '--config') {
+      const value = adapterArgs[++i];
+      if (value === undefined) throw new Error('Codex adapter emitted an incomplete config override');
+      overrides.push(value);
+    }
+  }
+  return overrides;
+}
+
+/** Consume exactly the owned occurrences, leaving later user args to the gateway. */
+function removeManagedCodexConfigArgs(args: ReadonlyArray<string>, overrides: ReadonlyArray<string>): string[] {
+  const remaining = new Map<string, number>();
+  for (const value of overrides) remaining.set(value, (remaining.get(value) ?? 0) + 1);
+  const forwarded: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    const value = args[i + 1];
+    if ((arg === '-c' || arg === '--config') && value !== undefined && remaining.has(value)) {
+      const count = remaining.get(value)!;
+      if (count === 1) remaining.delete(value);
+      else remaining.set(value, count - 1);
+      i++;
+      continue;
+    }
+    forwarded.push(arg);
+  }
+  if (remaining.size) throw new Error('Codex managed config no longer matches the launch arguments');
+  return forwarded;
+}
+
+/** Legacy/display callers without adapter provenance retain the historical filter.
+ * Worker launches use collectCodexConfigOverrides instead, preserving every generated config.
+ * 是否为 botmux 自己给 Codex 注入的 config 覆盖。精确白名单避免误伤用户自带的
  * `-c key=val`；wrapper 层据此决定剥离（aiden）或改成长参数（cjadk）。 */
 function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
@@ -485,6 +524,9 @@ export function ttadkAcceptsModel(wrapperCli: string | undefined): boolean {
 
 /** buildWrappedLaunch 的可选项。 */
 export interface WrappedLaunchOptions {
+  /** Exact config values emitted by the Codex adapter, before CLI_EXTRA_ARGS.
+   * Aiden's per-session shim must be installed with the same snapshot. */
+  readonly codexConfigOverrides?: ReadonlyArray<string>;
   /**
    * ttadk 网关专用：注入到 `ttadk <子命令> -m <model>` 的模型 id。空/未传时
    * 用 {@link TTADK_DEFAULT_MODEL} 兜底；不接受 -m 的子命令（CoCo）忽略此项。
@@ -492,7 +534,7 @@ export interface WrappedLaunchOptions {
   readonly ttadkModel?: string;
   /** Effective PATH inherited by the wrapper process. */
   readonly childPath?: string;
-  /** Resolved underlying Codex executable, used by the Aiden reasoning shim. */
+  /** Resolved underlying Codex executable, used by the Aiden config shim. */
   readonly aidenCodexRealBin?: string;
   /** Directory containing Botmux's `codex` shim. */
   readonly aidenCodexShimDir?: string;
@@ -583,13 +625,22 @@ export function buildWrappedLaunch(
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
   if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
   if (tokens[0] === 'aiden' && tokens[1] === 'x' && tokens[2] === 'codex') {
-    const { reasoningEffort, forwardedArgs } = rewriteAidenCodexArgs(cliArgs);
-    if (!reasoningEffort) {
+    const managed = opts.codexConfigOverrides;
+    const { reasoningEffort, forwardedArgs } = managed !== undefined
+      ? {
+        reasoningEffort: undefined,
+        forwardedArgs: stripSettingsArgs(removeManagedCodexConfigArgs(cliArgs, managed))
+          .filter(arg => arg !== '--dangerously-bypass-hook-trust'),
+      }
+      : rewriteAidenCodexArgs(cliArgs);
+    if (!reasoningEffort && !managed?.length) {
       return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
     }
     const realCodexBin = opts.aidenCodexRealBin ?? binResolver('codex');
     const shimDir = opts.aidenCodexShimDir;
     if (!shimDir) {
+      // Losing tool identity or managed model settings is not a valid fallback.
+      if (managed?.length) throw new Error('Aiden Codex managed-config shim is unavailable');
       return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
     }
     return {
@@ -597,13 +648,18 @@ export function buildWrappedLaunch(
       args: [binResolver(tokens[0]), ...tokens.slice(1), ...forwardedArgs],
       env: {
         BOTMUX_AIDEN_CODEX_REAL_BIN: realCodexBin,
-        BOTMUX_AIDEN_CODEX_REASONING_EFFORT: reasoningEffort,
+        ...(reasoningEffort ? { BOTMUX_AIDEN_CODEX_REASONING_EFFORT: reasoningEffort } : {}),
       },
     };
   }
   let forwarded: string[];
   if (isAidenWrapper(tokens)) forwarded = stripWrapperUnsafeArgs(cliArgs);
-  else if (isCjadkWrapper(tokens)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs);
+  else if (isCjadkWrapper(tokens)) forwarded = opts.codexConfigOverrides !== undefined
+    ? [
+      ...opts.codexConfigOverrides.flatMap(value => ['--config', value]),
+      ...removeManagedCodexConfigArgs(cliArgs, opts.codexConfigOverrides),
+    ]
+    : rewriteCjadkCodexConfigArgs(cliArgs);
   else forwarded = [...cliArgs];
   return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwarded] };
 }
