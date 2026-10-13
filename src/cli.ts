@@ -17867,9 +17867,10 @@ switch (command) {
       if (!daemon) throw new Error('Bot daemon is unavailable');
       const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
         { method: 'GET', signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
-      const body = await response.json() as { ok?: boolean; schemaVersion?: number; larkAppId?: string; sessionId?: string };
+      const body = await response.json() as { ok?: boolean; schemaVersion?: number; larkAppId?: string; sessionId?: string; target?: { chatId?: string; rootMessageId?: string } };
       if (response.ok && (body.ok !== true || body.schemaVersion !== 1
-        || body.larkAppId !== command.larkAppId || body.sessionId !== command.sessionId)) throw new Error('Registration observation identity mismatch');
+        || body.larkAppId !== command.larkAppId || (command.sessionId ? body.sessionId !== command.sessionId
+          : body.target?.chatId !== command.chatId || body.target?.rootMessageId !== command.rootMessageId))) throw new Error('Registration observation identity mismatch');
       console.log(JSON.stringify(body));
       if (!response.ok) process.exitCode = 1;
     } catch (error) {
