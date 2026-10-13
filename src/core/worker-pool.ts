@@ -14193,13 +14193,13 @@ function setupWorkerHandlers(
           }
         }
         const registeredTurn = ds.idempotentAsyncTurns?.get(msg.turnId);
-        if (registeredTurn?.kind === 'turn'
+        if ((registeredTurn?.kind === 'turn' || registeredTurn?.kind === 'routed_turn')
           && registeredTurn.ownerLarkAppId === ds.larkAppId
           && registeredTurn.workerGeneration === workerGeneration
           && !registeredTurn.postBarrierFault) {
           try {
             recordTurnInputCommit({
-              ownerLarkAppId: ds.larkAppId, key: registeredTurn.key,
+              ownerLarkAppId: ds.larkAppId, key: registeredTurn.key, kind: registeredTurn.kind,
               sessionId: ds.session.sessionId, triggerId: msg.turnId,
               ownerBootId: getDaemonBootId(), workerGeneration, observedAt: Date.now(),
             });
