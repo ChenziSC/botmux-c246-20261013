@@ -1,3 +1,6 @@
+import { registerContinuationAsk, reconcileAskContinuations, listAskContinuations } from './core/ask-broker.js';
+import { createAskContinuationDispatcher } from './core/ask-continuation.js';
+import { readTurnRegistration } from './core/trigger-registration.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -7968,6 +7971,7 @@ const explicitAskContinuation = createExplicitAskContinuation({
   },
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
 });
+ipcRoute('GET', '/api/asks/continuations', (_req, res) => jsonRes(res, 200, { ok: true, waits: listAskContinuations() }));
 
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
@@ -8092,6 +8096,19 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       ok: false, error: 'card_delivery_failed',
       detail: error instanceof Error ? error.message : 'Confirmation card cannot be delivered',
     });
+  }
+  if (boundAsk.deliveryMode === 'continuation') {
+    const origin = askSession?.managedTurnOrigin;
+    if (!askSession || !origin?.turnId || body.originTurnId !== origin.turnId
+      || body.originDispatchAttempt !== origin.dispatchAttempt) return jsonRes(res, 403, { ok: false, error: 'ask_continuation_origin_unproven' });
+    const identity = { larkAppId: askSession.larkAppId, sessionId: askSession.session.sessionId,
+      chatId: askSession.chatId, rootMessageId: askSession.session.scope === 'chat' ? null : askSession.session.rootMessageId };
+    try {
+      const registration = registerContinuationAsk({ ...boundAsk, ...identity, chatType: askChatType, deliveryTarget: documentDelivery,
+        ...(documentDelivery ? { answererOpenId: documentDelivery.openId } : {}),
+        continuation: { originTurnId: origin.turnId, originDispatchAttempt: origin.dispatchAttempt, state: 'waiting' } });
+      return jsonRes(res, 202, registration);
+    } catch { return jsonRes(res, 503, { ok: false, error: 'ask_continuation_registration_failed' }); }
   }
   const askInput = {
     larkAppId: boundAsk.larkAppId,
@@ -28712,6 +28729,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // BOT_HOME), split a legacy shared data/schedules.json if one still exists,
   // then watch our own store for external writes (e.g. `botmux schedule add`
   // running in a separate node process) so dashboard event bus stays in sync.
+  const deliverAskAnswer = createAskContinuationDispatcher({
+    submit: request => triggerSessionTurn(request, { larkAppId: cfg.larkAppId, activeSessions }),
+    observe: (sessionId, key) => readTurnRegistration(cfg.larkAppId, sessionId, key),
+  });
+  const askContinuationTimer = setInterval(() => {
+    if (sessionsRestored) void reconcileAskContinuations(cfg.larkAppId, deliverAskAnswer)
+      .catch(error => logger.warn(`ask continuation scan: ${String(error)}`));
+  }, 5_000);
+  askContinuationTimer.unref();
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
   try {
