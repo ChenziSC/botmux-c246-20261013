@@ -1,0 +1,12 @@
+  const askMarker=join(process.env.BOTMUX_TEST_ROOT,`ask-command-${process.env.BOTMUX_SESSION_ID}.json`);
+  if(!existsSync(askMarker)){
+    const threadId=request.params.threadId,turnId=`turn-fake-${turnAttempt}`;
+    respond(request.id,{turn:{id:turnId}});notify('turn/started',{threadId,turn:{id:turnId}});
+    setTimeout(()=>{
+      const command=spawn(join(process.env.HOME,'.botmux/bin/botmux'),['ask','buttons','--request-id','fixture-owner-decision','--options','continue,stop','Continue the isolated runtime task?'],{env:process.env,stdio:['ignore','pipe','pipe']});
+      let stdout='',stderr='';command.stdout.on('data',x=>stdout+=x);command.stderr.on('data',x=>stderr+=x);
+      command.on('error',error=>{writeFileSync(askMarker,JSON.stringify({error:String(error)}));emitTurnCompletion(threadId,turnId,request.params.outputSchema);});
+      command.on('exit',code=>{writeFileSync(askMarker,JSON.stringify({code,stdout,stderr,mode:process.env.BOTMUX_ASK_DELIVERY_MODE,sessionId:process.env.BOTMUX_SESSION_ID,rootMessageId:process.env.BOTMUX_ROOT_MESSAGE_ID}));emitTurnCompletion(threadId,turnId,request.params.outputSchema);});
+    },150);
+    return;
+  }
