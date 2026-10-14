@@ -6859,6 +6859,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   observe [--session <id>] [--lark-app <appId>] [--include-raw]
               通过 daemon 实时 IPC 输出 canonical worker/session JSON；失败保持 unknown，不回退缓存
   ask-fact --bot <appId> --session <id> --request <id> --ask <id>  宿主回读原生持久问题原件
+  interaction-actor --bot <appId> --chat <chatId> --open <openId> | --union <unionId>
+              宿主只读解析目标 App 用户身份并检查当前群成员和发言权限
   interaction-context --bot <appId> --session <id> [--actor <openId>]
               宿主只读查询真实会话来源及当前回答权限（不恢复会话）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -17626,7 +17628,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
+  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context', 'interaction-actor',
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
@@ -17855,6 +17857,23 @@ switch (command) {
       if (!response.ok) process.exitCode = 1;
     } catch (error) {
       console.error(`botmux interaction-context: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
+  case 'interaction-actor': {
+    try {
+      if (process.env.BOTMUX_SEND_RELAY || findAncestorSessionId()) throw new Error('Host context required');
+      const { parseInteractionActorCommand } = await import('./cli/interaction-actor.js');
+      const command = parseInteractionActorCommand(process.argv.slice(3));
+      const daemon = findDaemon(command.larkAppId);
+      if (!daemon) throw new Error('Bot daemon is unavailable');
+      const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
+        { ...command.init, signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
+      console.log(JSON.stringify(await response.json()));
+      if (!response.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(`botmux interaction-actor: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
     }
     break;
