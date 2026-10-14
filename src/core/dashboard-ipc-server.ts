@@ -1445,6 +1445,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/interaction-context', async (req, res
   }
 });
 
+// Resolves an App-local user identity; no authority or session ownership is assigned.
+ipcRoute('POST', '/api/interactions/actor', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const { observeInteractionActor } = await import('./interaction-actor.js');
+  const { resolveTargetAppOpenId, resolveUnionIdFromOpenId, listChatMemberOpenIds } = await import('../im/lark/client.js');
+  const { evaluateAskAnswerTalk } = await import('../im/lark/event-dispatcher.js');
+  try {
+    const result = await observeInteractionActor({ trustedHost: true, daemonAppId: cachedLarkAppId, body }, {
+      resolveOpenId: unionId => resolveTargetAppOpenId(cachedLarkAppId, unionId),
+      resolveUnionId: openId => resolveUnionIdFromOpenId(cachedLarkAppId, openId),
+      members: chatId => listChatMemberOpenIds(cachedLarkAppId, chatId),
+      canTalk: evaluateAskAnswerTalk,
+    });
+    return jsonRes(res, result.status, result.body);
+  } catch { return jsonRes(res, 503, { ok: false, error: 'interaction_actor_unavailable' }); }
+});
+
 // Exact host-installed input bindings. Never added to the session relay allowlist.
 ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, params) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
