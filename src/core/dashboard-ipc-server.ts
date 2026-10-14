@@ -1579,6 +1579,29 @@ ipcRoute('POST', '/api/interactions/actor', async (req, res) => {
   } catch { return jsonRes(res, 503, { ok: false, error: 'interaction_actor_unavailable' }); }
 });
 
+// External state owners provide display snapshots; native CLI reports cannot change them.
+ipcRoute('POST', '/api/groups/:chatId/project-projection', async (req,res,params)=>{
+  if(!isTrustedHostIpcRequest(req))return jsonRes(res,403,{ok:false,error:'trusted_host_required'});
+  try {
+    const body=await readJsonBody<Record<string,unknown>>(req);
+    const {readGroupCollaborationMode}=await import('../services/group-collaboration-mode-store.js');
+    const mode=readGroupCollaborationMode(config.session.dataDir,params.chatId);
+    if(body.larkAppId!==cachedLarkAppId || mode?.mode!=='project' || mode.coordinatorAppId!==cachedLarkAppId)
+      return jsonRes(res,409,{ok:false,error:'project_projection_coordinator_mismatch'});
+    const {parseProjectProjection}=await import('../services/project-projection.js');
+    const input=parseProjectProjection(body.projection);
+    const {projectCoordinator}=await import('../services/project-coordinator-runtime.js');
+    const {ensureDefaultWhiteboard,readWhiteboard,writeWhiteboard,whiteboardEnabled}=await import('../services/whiteboard-store.js');
+    const project=await projectCoordinator.project({dataDir:config.session.dataDir,chatId:params.chatId,
+      larkAppId:cachedLarkAppId,coordinatorSessionId:''},input,async (snapshot,hash)=>{
+      if(!whiteboardEnabled())return;
+      const board=ensureDefaultWhiteboard({larkAppId:cachedLarkAppId,chatId:params.chatId,workingDir:snapshot.workingDir,title:snapshot.snapshot.title});
+      if(readWhiteboard(board.id)!==snapshot.snapshot.board)writeWhiteboard(board.id,snapshot.snapshot.board,{actor:snapshot.providerId,kind:'projection',projectionHash:hash});
+    });
+    return jsonRes(res,200,{ok:true,projection:project.projection});
+  }catch(error){return jsonRes(res,409,{ok:false,error:error instanceof Error?error.message:'project_projection_unavailable'});}
+});
+
 // Exact host-installed input bindings. Never added to the session relay allowlist.
 ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, params) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
