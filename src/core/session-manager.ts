@@ -2738,6 +2738,9 @@ export async function restoreActiveSessions(
       if (adoptSandboxBlocked(adoptBotCfg, session)) {
         logger.warn(`[${session.sessionId.substring(0, 8)}] isolated/no-transport session persisted as adopt — converting to cold-start (a sandbox / apiOnly bot can't wrap a live external CLI)`);
         session.adoptedFrom = undefined;
+        // The cold start resumes the external CLI's transcript, which lives on the
+        // default data root: drop any profile an older build froze onto the adopt row.
+        session.cliConfigDir = undefined;
         if (session.title?.startsWith('Adopt:')) {
           const project = session.title.slice('Adopt:'.length).trim();
           session.title = project || 'Session';
@@ -3226,11 +3229,19 @@ export async function restoreActiveSessions(
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
-    ensureOrdinaryTurnRecoveryAttached(ds);
-    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
-    if (!restoredLeaseId
-      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
-      ensureReadonlyTaskContinuationAttached(ds);
+    try {
+      ensureOrdinaryTurnRecoveryAttached(ds);
+      const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+      if (!restoredLeaseId
+        || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+        ensureReadonlyTaskContinuationAttached(ds);
+      }
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Isolated recovery re-arm failure; `
+        + `durable row retained and daemon startup continuing: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

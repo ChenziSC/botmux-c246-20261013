@@ -230,6 +230,7 @@ import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery } from './work
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
+import { cliSupportsConfigDir, normalizeCliConfigDir } from './cli-config-dir.js';
 import {
   getDocSubscription,
   listAllDocSubscriptions,
@@ -2690,7 +2691,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
   if (!token) return jsonRes(res, 403, { ok: false, error: delegated
-    ? delegatedError(`the original user's authorization for ${bot.larkAppId} is missing`)
+    ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
     : `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
   return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', credentialType: 'user_access_token', credential: token });
 });
@@ -2754,7 +2755,22 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
     }
-    const callerOpenId = origin.callerOpenId;
+    const cfg = getBot(ds.larkAppId).config;
+    // Only the daemon's verified, turn-bound dispatch can supply a delegated
+    // human. The CLI still cannot choose a user or an application.
+    const requestingUser = (): string | undefined => {
+      const liveOrigin = ds.managedTurnOrigin;
+      if (!liveOrigin?.turnId) return undefined;
+      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.turnId);
+      if (!grant) return liveOrigin.callerOpenId;
+      if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
+        || !triggerUserAuthApplies(getBot(ds.larkAppId).config.triggerUserAuth, 'lark-cli')) return undefined;
+      return grant.targetOpenId;
+    };
+    const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, origin.turnId);
+    const callerOpenId = requestingUser();
+    if (!callerOpenId) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    const originCallerOpenId = origin.callerOpenId;
     const turnId = origin.turnId;
     const capability = origin.capability;
     const attempt = origin.dispatchAttempt;
@@ -2762,9 +2778,10 @@ for (const action of ['auth-request', 'auth-status']) {
     const generation = ds.workerGeneration;
     const isCurrent = () => findActiveBySessionId(params.sessionId) === ds
       && ds.session.status === 'active' && ds.worker === worker && !worker.killed
-      && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === callerOpenId
+      && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === originCallerOpenId
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
-      && ds.managedTurnOrigin?.dispatchAttempt === attempt;
+      && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
+      && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) === JSON.stringify(delegated);
     // The authorization may outlive the turn that started it: the same human's
     // follow-up message rotates the turn while they are tapping the approval
     // link. Keep polling (and accept the granted token) as long as the session's
@@ -2772,10 +2789,9 @@ for (const action of ['auth-request', 'auth-status']) {
     const samePrincipalActive = (): boolean => {
       const live = findActiveBySessionId(params.sessionId);
       return live === ds && ds.session.status === 'active' && !!ds.worker && !ds.worker.killed
-        && ds.managedTurnOrigin?.callerOpenId === callerOpenId;
+        && requestingUser() === callerOpenId;
     };
     const authorizationCurrent = (): boolean => isCurrent() || samePrincipalActive();
-    const cfg = getBot(ds.larkAppId).config;
     if (!boundTool && !triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
       return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
     }
@@ -2784,6 +2800,11 @@ for (const action of ['auth-request', 'auth-status']) {
       const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
       if (!request || request.sessionId !== params.sessionId) {
         return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
+      }
+      // A different human (including a different human behind the same bot)
+      // must not poll or publish the previous person's grant.
+      if (request.callerOpenId !== callerOpenId) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
       const result = await request.poll();
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
@@ -2808,7 +2829,7 @@ for (const action of ['auth-request', 'auth-status']) {
       const liveOrigin = liveDs === ds ? ds.managedTurnOrigin : liveDs?.managedTurnOrigin;
       const samePrincipalLive = !!liveDs && liveDs.session.status === 'active'
         && !!liveDs.worker && !liveDs.worker.killed
-        && liveOrigin?.callerOpenId === request.callerOpenId && !!liveOrigin.turnId;
+        && liveDs === ds && requestingUser() === request.callerOpenId && !!liveOrigin?.turnId;
       if (!samePrincipalLive) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
@@ -2839,8 +2860,9 @@ for (const action of ['auth-request', 'auth-status']) {
     const scopes = [...new Set(body.scopes as string[])];
     const unknownScopes = scopes.filter(scope => !isKnownLarkUserScope(scope));
     if (unknownScopes.length) return jsonRes(res, 400, { ok: false, error: 'unknown_scopes', scopes: unknownScopes });
-    const cached = getIdentity(ds.larkAppId, callerOpenId);
-    const identity = cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+    const cached = delegated ? undefined : getIdentity(ds.larkAppId, callerOpenId);
+    const identity = delegated ? { type: 'user' as const, openId: callerOpenId }
+      : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
       ? cached
       : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
@@ -7912,6 +7934,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     cliRuntime?: unknown;
     dshRuntime?: unknown;
     dshProfile?: unknown;
+    cliConfigDir?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
@@ -8017,6 +8040,27 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     if (trimmed) {
       nextDshProfile = normalizeDshProfile(trimmed);
       if (!nextDshProfile) return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_profile' });
+    }
+  }
+  // Config profile dir (claude-code: CLAUDE_CONFIG_DIR). Same present/absent
+  // semantics as dshProfile: present writes/clears, absent preserves (older
+  // Dashboard clients), an unsupported CLI always drops it. Must already exist —
+  // a typo would otherwise silently start a fresh, login-less profile.
+  const supportsCliConfigDir = cliSupportsConfigDir(selected.cliId);
+  const cliConfigDirFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliConfigDir');
+  let nextCliConfigDir: string | undefined;
+  if (cliConfigDirFieldPresent && body.cliConfigDir !== null) {
+    try {
+      nextCliConfigDir = normalizeCliConfigDir(body.cliConfigDir);
+    } catch (err) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_cli_config_dir', message: ipcErrorText(err) });
+    }
+    if (nextCliConfigDir && !supportsCliConfigDir) {
+      return jsonRes(res, 400, { ok: false, error: 'cli_config_dir_unsupported', message: `${selected.cliId} 不支持配置目录` });
+    }
+    if (nextCliConfigDir) {
+      const check = validateWorkingDir(nextCliConfigDir);
+      if (!check.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_cli_config_dir', message: check.error });
     }
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
@@ -8251,6 +8295,11 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         if (nextDshProfile !== undefined) entry.dshProfile = nextDshProfile;
         else delete entry.dshProfile;
       }
+      if (!supportsCliConfigDir) delete entry.cliConfigDir;
+      else if (cliConfigDirFieldPresent) {
+        if (nextCliConfigDir !== undefined) entry.cliConfigDir = nextCliConfigDir;
+        else delete entry.cliConfigDir;
+      }
       if (entry.readIsolation === true &&
           !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli, cliLaunchMode: selected.cliLaunchMode })) {
         delete entry.readIsolation;
@@ -8313,6 +8362,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
     if (!supportsDshProfile) bot.config.dshProfile = undefined;
     else if (dshProfileFieldPresent) bot.config.dshProfile = nextDshProfile;
+    // Live sessions keep their frozen profile (Session.cliConfigDir); only new
+    // sessions pick this up, so a profile change never closes running sessions.
+    if (!supportsCliConfigDir) bot.config.cliConfigDir = undefined;
+    else if (cliConfigDirFieldPresent) bot.config.cliConfigDir = nextCliConfigDir;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
@@ -8341,6 +8394,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
       dshProfile: supportsDshProfile ? bot.config.dshProfile ?? null : null,
+      cliConfigDir: supportsCliConfigDir ? bot.config.cliConfigDir ?? null : null,
       selectionKey,
       // Number kept for compatibility with an older dashboard bundle; the residual
       // count rides alongside so a hot CLI switch cannot silently strand a remote

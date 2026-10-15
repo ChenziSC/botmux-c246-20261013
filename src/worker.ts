@@ -254,7 +254,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
@@ -1866,6 +1866,11 @@ function provisionIsolatedBotHome(
    *  credential must NOT be seeded (the caller copies the source afterwards and
    *  fails closed on error, outside this best-effort block). */
   claudeCredFromSource = false,
+  /** The bot's Claude config profile (`cliConfigDir`), resolved. When set it is
+   *  the provisioning SOURCE in place of the global `~/.claude`: its settings
+   *  env, its login and its `.claude.json` seed the per-bot dir, so a sandboxed
+   *  bot runs the same profile an unsandboxed one would — never the global one. */
+  claudeProfileDir?: string,
 ): void {
   try {
     if (isClaude) {
@@ -1882,7 +1887,7 @@ function provisionIsolatedBotHome(
           installHook(cliId, {
             ...hookInstall,
             configPath: isolatedSettingsPath,
-            inheritClaudeEnvFrom: join(homedir(), '.claude', 'settings.json'),
+            inheritClaudeEnvFrom: join(claudeProfileDir ?? join(homedir(), '.claude'), 'settings.json'),
             ...(claudeCredFromSource ? { inheritClaudeEnvExclude: CLAUDE_AUTH_OVERRIDE_ENV_KEYS } : {}),
           }, hookCommandFor(cliId));
         } catch (e) {
@@ -1894,7 +1899,11 @@ function provisionIsolatedBotHome(
       // on EVERY spawn (verified: Claude logs in from that file). Refreshing here (not
       // just seeding once) means a re-login elsewhere self-heals on the next cold
       // spawn — no separate sync step needed. Same shared account for every bot.
-      const fresh = claudeCredFromSource ? null : freshestClaudeCred();
+      // A profile carries its own login (or none, when it authenticates through
+      // its settings env): never fall back to the shared global account for it.
+      const fresh = claudeCredFromSource
+        ? null
+        : claudeProfileDir ? readClaudeCredFile(join(claudeProfileDir, '.credentials.json')) : freshestClaudeCred();
       if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
       else if (claudeCredFromSource) { /* copied by the caller from credentialsSourceDir */ }
       else if (
@@ -1906,7 +1915,12 @@ function provisionIsolatedBotHome(
       // State: seed <cdir>/.claude.json from the GLOBAL one MINUS `projects` (keeps the
       // onboarding/promo "seen" flags + account so no dialogs appear, without leaking
       // other projects' data), then trust this bot's cwd. Merge-safe on resume.
-      seedAndTrustClaudeState(join(cdir, '.claude.json'), workingDir, log);
+      seedAndTrustClaudeState(
+        join(cdir, '.claude.json'),
+        workingDir,
+        log,
+        claudeProfileDir ? join(claudeProfileDir, '.claude.json') : undefined,
+      );
     } else {
       const cdir = provisionCodexAuth({ botHome, mode: codexAuthSync, log });
       // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
@@ -1962,6 +1976,16 @@ function freshestClaudeCred(): string | null {
   return cands[0].raw;
 }
 
+/** Raw credential JSON from one file, or null when absent / empty / unreadable. */
+function readClaudeCredFile(path: string): string | null {
+  try {
+    const raw = readFileSync(path, 'utf-8').trim();
+    return raw || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Write a credential file (mode 0600) only when its content actually changed —
  *  avoids needless mtime churn on every spawn. Trailing-newline differences are
  *  ignored for the comparison; the written form is newline-terminated. */
@@ -1977,14 +2001,20 @@ function writeCredIfChanged(dst: string, raw: string): void {
  *  so onboarding/promo dialogs are pre-dismissed and the account is recognized, then
  *  mark this bot's realpath(cwd) trusted. Merge-safe: only seeds when absent; always
  *  refreshes the cwd trust. */
-function seedAndTrustClaudeState(statePath: string, workingDir: string, log: (m: string) => void): void {
+function seedAndTrustClaudeState(
+  statePath: string,
+  workingDir: string,
+  log: (m: string) => void,
+  /** Seed source; defaults to the global `~/.claude.json` (a config profile passes its own). */
+  seedFrom: string = join(homedir(), '.claude.json'),
+): void {
   try {
     let data: Record<string, any> = {};
     if (existsSync(statePath)) {
       try { data = JSON.parse(readFileSync(statePath, 'utf-8')); } catch { data = {}; }
     } else {
       try {
-        const g = JSON.parse(readFileSync(join(homedir(), '.claude.json'), 'utf-8')) as Record<string, any>;
+        const g = JSON.parse(readFileSync(seedFrom, 'utf-8')) as Record<string, any>;
         const { projects: _drop, ...top } = g;
         data = top;
       } catch { data = {}; }
@@ -5618,7 +5648,7 @@ function failedBridgeFailureText(errorCode?: string, summary?: string): string {
       ? 'worker.empty_final_failed_auth'
       : errorCode === CODEX_CONNECTION_ERROR_CODE
         ? 'worker.empty_final_failed_connection'
-        : errorCode === CODEX_UPSTREAM_ERROR_CODE
+        : errorCode === CODEX_UPSTREAM_ERROR_CODE || errorCode === CODEX_CAPACITY_ERROR_CODE
           ? 'worker.empty_final_failed_upstream'
           : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
@@ -9646,6 +9676,10 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
 let herdrWebHistory: HerdrWebHistoryState | null = null;
+/** Bumped when an adopted Herdr pane's grid changes. The pane text can stay
+ *  identical, so the PTY-activity watermark alone would never re-capture the
+ *  screen at the new geometry (see startScreenUpdates). */
+let observedPaneGridRevision = 0;
 let herdrWebScrollDirection: HerdrWebScrollDirection = null;
 let herdrWebCursor: HerdrWebTerminalCursor | null = null;
 const WORKFLOW_TRANSCRIPT_MAX = 2_000_000; // chars (~2MB)
@@ -9669,7 +9703,11 @@ function usesHerdrSnapshotWebHistory(): boolean {
 }
 
 function herdrWebCursorSequence(cursor = herdrWebCursor): string {
-  return cursor ? `\x1b[${cursor.row + 1};${cursor.col + 1}H` : '';
+  if (cursor) return `\x1b[${cursor.row + 1};${cursor.col + 1}H`;
+  // Herdr exposes no cursor for a pane botmux does not attach to. Hide xterm's
+  // cursor instead of leaving it where the snapshot text ended, and park it at
+  // column 1 so the focused input helper doesn't drag the view to the far right.
+  return lastInitConfig?.adoptMode && backend instanceof HerdrBackend ? '\r\x1b[?25l' : '';
 }
 
 function relayHerdrWebCursor(cursor: HerdrWebTerminalCursor): void {
@@ -9678,6 +9716,20 @@ function relayHerdrWebCursor(cursor: HerdrWebTerminalCursor): void {
   for (const ws of wsClients) {
     if (ws.readyState === WebSocket.OPEN) ws.send(sequence);
   }
+}
+
+/** Fixed-grid pin each viewer of an adopted pane was last sent. */
+const adoptWebGridPins = new WeakMap<WebSocket, string>();
+
+/**
+ * Adopted Herdr snapshots carry the user's pane width. Viewers are pinned to
+ * that grid when they connect; when the user resizes the pane, re-pin each
+ * viewer before the next frame or every full-width row wraps in the browser.
+ */
+function herdrAdoptWebGridPin(): string {
+  if (!lastInitConfig?.adoptMode || !(backend instanceof HerdrBackend) || wsClients.size === 0) return '';
+  const size = backend.getPaneSize();
+  return size && size.cols > 0 && size.rows > 0 ? `\x1b]1989;${size.cols};${size.rows}\x07` : '';
 }
 
 function relayHerdrWebSnapshot(snapshot: string): void {
@@ -9690,9 +9742,17 @@ function relayHerdrWebSnapshot(snapshot: string): void {
   herdrWebHistory = merged.state;
   herdrWebScrollDirection = null;
   scrollback = renderHerdrWebHistory(merged.state);
+  // The browser only recognises a history frame at the start of a message,
+  // so a grid pin travels as its own frame ahead of it.
+  const pin = herdrAdoptWebGridPin();
   const payload = `\x1b]1989;history;${merged.addedLines}\x07${scrollback}${herdrWebCursorSequence()}`;
   for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    if (pin && adoptWebGridPins.get(ws) !== pin) {
+      ws.send(pin);
+      adoptWebGridPins.set(ws, pin);
+    }
+    ws.send(payload);
   }
 }
 
@@ -10632,7 +10692,8 @@ async function captureAndUpload(): Promise<void> {
       const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
       if (frameIsStale()) { cancelStale('snapshot'); return; }
       if (pipeResult) {
-        const key = dedupKey(pipeResult.ansi);
+        // Same ANSI on a resized canvas is a different picture.
+        const key = dedupKey(`${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
@@ -15078,6 +15139,7 @@ function startScreenUpdates(): void {
   // web-attach (isScreenSelfDriven) keeps changing without bumping the
   // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
+  let lastSnapshotGridRevision = observedPaneGridRevision;
   screenUpdateTimer = setInterval(() => {
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
@@ -15136,19 +15198,23 @@ function startScreenUpdates(): void {
         // self-driven screen (observe backend with a live web-attach): the
         // watermark can't be trusted there, so capture every tick.
         const ptyActivity = lastPtyActivityAtMs;
-        if (shouldCaptureScreen({
+        const gridRevision = observedPaneGridRevision;
+        if (gridRevision !== lastSnapshotGridRevision || shouldCaptureScreen({
           ptyActivity,
           lastCapturedPtyActivity: lastSnapshotPtyActivity,
           screenSelfDriven: isScreenSelfDriven(backend),
         })) {
           lastSnapshotPtyActivity = ptyActivity;
+          lastSnapshotGridRevision = gridRevision;
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
           // from tmux every tick. This eliminates the accumulated-buffer drift
           // that produced duplicated/staircase text in 'text' display mode.
           const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true });
           if (pipeText) {
             content = pipeText.content;
-            const hash = pipeText.ansi;
+            // Geometry is part of the frame: the same ANSI re-wrapped on a
+            // resized pane renders different text.
+            const hash = `${pipeText.cols}x${pipeText.rows}:${pipeText.ansi}`;
             changed = hash !== lastTextSnapshotHash;
             lastTextSnapshotHash = hash;
             // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
@@ -15815,6 +15881,7 @@ async function spawnCli(
     });
 
     wireHerdrWebTerminalRelays(herdrBe);
+    herdrBe.onPaneGridChange(() => { observedPaneGridRevision++; });
     seedBackendScreen('herdr adopt', herdrBe);
 
     await setupAdoptTranscriptBridges(cfg);
@@ -15929,7 +15996,7 @@ async function spawnCli(
   const effectiveCliId: CliId = cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'
     ? 'dsh-tui'
     : cfg.cliId as CliId;
-  cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride);
+  cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
   if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
@@ -16654,6 +16721,10 @@ async function spawnCli(
   if (willRedirectCliData) {
     isolationBotHome = ownBotHome!;
     const isClaudeFam = !!claudeDataDir;
+    // Captured before the redirect below: with a config profile the adapter's
+    // data root IS the (resolved) profile dir, and it becomes the provisioning
+    // source for BOT_HOME instead of the global ~/.claude.
+    const claudeProfileDir = isClaudeFam && cfg.cliConfigDir ? claudeDataDir : undefined;
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
@@ -16674,6 +16745,7 @@ async function spawnCli(
         cfg.codexAuthSync ?? 'shared',
         log,
         credentialSourceFiles !== undefined,
+        claudeProfileDir,
       );
       if (credentialSourceFiles && claudeDataDir) {
         // Outside provisionIsolatedBotHome's best-effort catch on purpose: a
@@ -21555,7 +21627,11 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // (sent BEFORE the seed so the client resizes before rendering it).
         if (lastInitConfig?.adoptMode && isObserveBackend(backend)) {
           const sz = (backend as ObserveBackend).getPaneSize();
-          if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
+          if (sz && sz.cols > 0 && sz.rows > 0) {
+            const pin = `\x1b]1989;${sz.cols};${sz.rows}\x07`;
+            ws.send(pin);
+            adoptWebGridPins.set(ws, pin);
+          }
         }
         // Pin a read-only viewer to the authoritative grid before sending the
         // seed. Its FitAddon may still report the browser viewport below, but
@@ -21982,10 +22058,101 @@ try{
 // 首帧字号已经在 new Terminal 里按容器宽度定好了；这个函数负责后续尺寸变化
 // （转屏、iframe 改宽、分屏、地址栏收放）时复算。返回 true 表示字号真的换了档。
 function _wbApplyAutoFontSize(){
+  var before=term.options.fontSize;
   var next=_wbAutoFontSize(_wbTerminalWidth());
-  if(term.options.fontSize===next)return false;
-  term.options.fontSize=next;
-  return true;
+  // 固定网格撑开过的行距、字间距先复位到基准：字号按基准间距重新适配；离开固定网格
+  // 也靠这一步还原。
+  _wbResetGridSpacing();
+  if(fixedSize)next=_wbFixedGridFontSize(next);
+  if(next!==before)term.options.fontSize=next;
+  if(fixedSize){_wbSettleFixedGridFont();_wbStretchFixedGrid();}
+  return term.options.fontSize!==before;
+}
+// 固定网格（adopt 的 pane、托管 Herdr 的 follower 等）的行列数由远端决定。按容器宽度
+// 算出的字号要么放不下（出横向滚动条），要么放得下却铺不满（四周留白）。这里照远程桌面
+// 「适应窗口」的做法：取宽、高都放得下整张网格的最大字号，等比缩放，只在一个方向上留下
+// 不到一档的空隙。下限 _WB_FONT_MIN（再小就读不了，宁可滚动）；上限 _WB_FIXED_FONT_MAX
+// （防止很小的远端网格在大屏上被放成巨字）。
+// 单元格尺寸用 xterm 实测值（FitAddon 读的也是它）。可用空间要扣掉 .xterm 自身的
+// padding：fixed-grid 给滚动条预留的右边距，以及触屏可写时给底部输入栏和软键盘留的
+// 下边距（--mobile-bar-h / --keyboard-inset，两者变化时都会触发 onViewportResize 重新适配）。
+var _WB_FIXED_FONT_MAX=24;
+// 外观设置给的基准行距（经典 1 / 阅读风 1.15，见外观消息处理）。固定网格的撑开以它为底。
+var _wbLineHeightBase=1;
+function _wbFixedGridMetrics(){
+  var host=document.getElementById('terminal');
+  var dims=term._core&&term._core._renderService&&term._core._renderService.dimensions;
+  var cell=dims&&dims.css&&dims.css.cell;
+  var cs=term.element&&window.getComputedStyle?window.getComputedStyle(term.element):null;
+  var px=function(v){var n=parseFloat(v);return n>0?n:0;};
+  var padX=cs?px(cs.paddingLeft)+px(cs.paddingRight):15;
+  var padY=cs?px(cs.paddingTop)+px(cs.paddingBottom):0;
+  var m={
+    cellW:cell?cell.width:0,cellH:cell?cell.height:0,
+    availW:(host?host.clientWidth:0)-padX,availH:(host?host.clientHeight:0)-padY
+  };
+  m.ok=m.cellW>0&&m.cellH>0&&m.availW>0&&m.availH>0&&term.cols>0&&term.rows>0;
+  return m;
+}
+function _wbFixedGridFits(m){
+  return m.cellW*term.cols<=m.availW&&m.cellH*term.rows<=m.availH;
+}
+function _wbFixedGridFontSize(base){
+  var m=_wbFixedGridMetrics(),f=term.options.fontSize;
+  if(!m.ok)return base;
+  var fitted=Math.floor(Math.min(m.availW*f/(m.cellW*term.cols),m.availH*f/(m.cellH*term.rows))*2)/2;
+  if(fitted>_WB_FIXED_FONT_MAX)return _WB_FIXED_FONT_MAX;
+  return fitted<_WB_FONT_MIN?_WB_FONT_MIN:fitted;
+}
+// 单元格尺寸按设备像素取整，与字号并不严格成正比（实测字宽 / 字号在 0.556~0.6 之间浮动），
+// 所以估算落档后要按实测尺寸校正：放不下就逐半档下调，放得下再逐半档试着上调，直到刚好
+// 放得下为止。下限也放不下时停在下限，保留滚动。
+function _wbSettleFixedGridFont(){
+  var m=_wbFixedGridMetrics();
+  if(!m.ok)return;
+  while(term.options.fontSize>_WB_FONT_MIN&&!_wbFixedGridFits(m)){
+    term.options.fontSize=term.options.fontSize-.5;
+    m=_wbFixedGridMetrics();
+  }
+  while(term.options.fontSize<_WB_FIXED_FONT_MAX&&_wbFixedGridFits(m)){
+    var at=term.options.fontSize;
+    term.options.fontSize=at+.5;
+    m=_wbFixedGridMetrics();
+    if(!_wbFixedGridFits(m)){term.options.fontSize=at;break;}
+  }
+}
+// 字号只能按档变化，浏览器和远端网格的宽高比也未必一致，等比缩放之后总有一边留白。
+// 字形不动：剩余高度用行距撑满，剩余宽度用字间距撑满。xterm 把单元格按物理像素取整，
+// 所以宽度最多还差「列数 x 1 个物理像素」，高度最多差「行数 x 1 个物理像素」。两者都
+// 设上限，避免宽高比相差悬殊时排得过散。
+var _WB_FIXED_LINE_STRETCH=1.5,_WB_FIXED_LETTER_STRETCH=.2;
+function _wbResetGridSpacing(){
+  if(term.options.lineHeight!==_wbLineHeightBase)term.options.lineHeight=_wbLineHeightBase;
+  if(term.options.letterSpacing)term.options.letterSpacing=0;
+}
+function _wbStretchFixedGrid(){
+  var m=_wbFixedGridMetrics();
+  if(!m.ok||!_wbFixedGridFits(m))return;
+  var lh=Math.min(_wbLineHeightBase*_WB_FIXED_LINE_STRETCH,
+    _wbLineHeightBase*m.availH/(m.cellH*term.rows));
+  // 行高按物理像素向下取整，估算偶尔会多出一个像素：放不下就一点点往回收。
+  for(var i=0;i<40&&lh>_wbLineHeightBase;i++){
+    term.options.lineHeight=lh;
+    m=_wbFixedGridMetrics();
+    if(_wbFixedGridFits(m))break;
+    lh=Math.max(_wbLineHeightBase,lh-.005);
+  }
+  if(!_wbFixedGridFits(m)){term.options.lineHeight=_wbLineHeightBase;m=_wbFixedGridMetrics();}
+  // 字间距的单位因渲染器而异（WebGL / Canvas 按物理像素取整，DOM 按 CSS 像素），按
+  // 物理像素估算，放不下就逐个往回收。
+  var dpr=window.devicePixelRatio||1;
+  var ls=Math.min(Math.floor(m.cellW*_WB_FIXED_LETTER_STRETCH*dpr),
+    Math.floor((m.availW/term.cols-m.cellW)*dpr));
+  for(;ls>0;ls--){
+    term.options.letterSpacing=ls;
+    if(_wbFixedGridFits(_wbFixedGridMetrics()))return;
+  }
+  if(term.options.letterSpacing)term.options.letterSpacing=0;
 }
 fit.fit();
 // 这条通道到底能不能写，以**已经建立的 WS** 为准（见页面顶部 wsHasWrite 那段注释）。
@@ -22062,8 +22229,11 @@ window.addEventListener('message',function(_ev){
     // 1.3 对中文密集的 TUI 内容还是偏松：汉字撑满 em 框，行间空隙观感接近隔行，于是
     // 再收一档到 1.15（单元格高约 18.2px），比经典松一成半，读起来才连成一段。
     term.options.lineHeight=_d.termStyle==='reader'?1.15:1;
-    // Refit only an owned grid; followers must preserve the remote row/column count.
+    _wbLineHeightBase=term.options.lineHeight;
+    // Refit only an owned grid; followers must preserve the remote row/column count
+    // and re-fit their font instead, since the line height changes the grid height.
     if(!fixedSize)fit.fit();
+    else _wbApplyAutoFontSize();
   }catch(_e){}
 });
 // xterm parses writes asynchronously.  On a brand-new page the first tmux /
@@ -22412,18 +22582,21 @@ if(typeof ResizeObserver!=='undefined'){
     if(_hf){
       _setFixedGrid(true);var _hc=+_hf[1],_hr=+_hf[2];
       if(_hc>0&&_hr>0){try{term.resize(_hc,_hr)}catch(ex){}_lastC=_hc;_lastR=_hr}
+      try{_wbApplyAutoFontSize()}catch(ex){}
       data=data.replace(_hf[0],'');
     }
     var _ho=data.match(/\\x1b\\]1989;owner\\x07/);
     if(_ho){
       _setFixedGrid(false);data=data.replace(_ho[0],'');
+      // 离开固定网格：字号回到按容器宽度自适应的那一档，再 fit 回自己的视口。
+      try{_wbApplyAutoFontSize()}catch(ex){}
       try{fit.fit()}catch(ex){}
       _lastC=_lastR=0;sendResize();
     }
     // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
-    if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
+    if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}try{_wbApplyAutoFontSize()}catch(ex){}data=data.replace(_fs[0],'')}
     // botmux OSC 1989: 移动端输入模式呈现同步（buffer 缓冲 / live 实时）。
     // 纯显示/交互态控制帧，不改变服务端权限门禁。使用服务端共享正则编译实例。
     var _mim=data.match(_wbMimRegex);
