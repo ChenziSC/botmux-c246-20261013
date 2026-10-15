@@ -1,3 +1,4 @@
+import {configuredGroupContext} from './core/interaction-context.js';
 import { registerContinuationAsk, reconcileAskContinuations, listAskContinuations, readContinuationAskFact } from './core/ask-broker.js';
 import { createAskContinuationDispatcher } from './core/ask-continuation.js';
 import { readTurnRegistration } from './core/trigger-registration.js';
@@ -30001,6 +30002,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       larkAppId: cfg.larkAppId,
       store: createInputCaptureStore(config.session.dataDir, cfg.larkAppId),
       session(id) {
+        const group=configuredGroupContext(cfg.larkAppId,id,chatId=>!!getBot(cfg.larkAppId).config.oncallChats?.some(c=>c.chatId===chatId));
+        if(group)return group;
         const ds = [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === id);
         if (!ds || ds.session.vcMeetingReceiver || !['chat', 'thread'].includes(ds.scope)) return undefined;
         return { sessionId: id, larkAppId: ds.larkAppId, chatId: ds.chatId,
@@ -30011,7 +30014,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       pluginEnabled: id => resolveEffectivePluginIds(getBot(cfg.larkAppId).config, readGlobalConfig()).includes(id)
         && !!readPluginRegistry().plugins[id]?.contributions?.cardActions,
       canTalk: (session, actor, memberUnionId) => evaluateAskAnswerTalk(cfg.larkAppId, session.chatId, actor,
-        [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === session.sessionId)?.chatType,
+        [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === session.sessionId)?.chatType ?? (session.chatType === 'group' ? 'group' : undefined),
         { memberUnionId }),
       deliver: deliverCapturedInput,
       warn: () => logger.warn('[input-capture] delivery pending; retained for reconciliation'),

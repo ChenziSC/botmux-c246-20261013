@@ -1544,11 +1544,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/interaction-context', async (req, res
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   const body = await readJsonBodyOrBadJson<unknown>(req, res);
   if (body === BAD_JSON) return;
-  const { observeInteractionContext } = await import('./interaction-context.js');
+  const { observeInteractionContext,configuredGroupContext } = await import('./interaction-context.js');
   const { evaluateAskAnswerTalk } = await import('../im/lark/event-dispatcher.js');
   try {
     const result = observeInteractionContext({ trustedHost: true, daemonAppId: cachedLarkAppId, sessionId: params.sessionId, body }, {
       findActive(id) {
+        const group=configuredGroupContext(cachedLarkAppId,id,chatId=>!!getBot(cachedLarkAppId).config.oncallChats?.some(c=>c.chatId===chatId));
+        if(group)return group;
         const ds = findActiveBySessionId(id);
         return ds ? { ...ds.session, larkAppId: ds.larkAppId, chatType: ds.chatType } : undefined;
       },
@@ -1612,7 +1614,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
   if (!runtime) return jsonRes(res, 503, { ok: false, error: 'input_capture_unavailable' });
   try {
     let result: unknown;
-    if (body.operation === 'register') result = runtime.register(params.sessionId, body);
+    if (body.operation === 'capabilities') result = runtime.capabilities();
+    else if (body.operation === 'inspect-registration') result = runtime.inspectRegistration(params.sessionId, body);
+    else if (body.operation === 'reconcile') result = runtime.reconcile(params.sessionId, body);
+    else if (body.operation === 'register') result = runtime.register(params.sessionId, body);
     else if (body.operation === 'revoke-set') result = runtime.revokeSet(params.sessionId, body.bindings);
     else if (typeof body.bindingId === 'string' && /^[a-f0-9]{64}$/.test(body.bindingId)) {
       if (body.operation === 'inspect') result = runtime.inspect(params.sessionId, body.bindingId, { after: body.after, through: body.through });
@@ -1623,9 +1628,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
     return jsonRes(res, result ? 200 : 404, { ok: !!result, schemaVersion: 1, result });
   } catch (error) {
     const message = error instanceof Error ? error.message : '';
-    const conflict = /^input_capture_(?:identity|anchor|revision|inputs)_conflict$/.test(message);
-    const invalid = ['invalid_input_capture_conditions', 'invalid_input_capture_page'].includes(message);
-    return jsonRes(res, invalid ? 400 : conflict ? 409 : 503, { ok: false, error: invalid || conflict ? message : 'input_capture_unavailable' });
+    const conflict = /^input_capture_(?:identity|anchor|revision|inputs|request_hash)_conflict$/.test(message);
+    const rejected = message === 'input_capture_registration_closed' || message === 'input_capture_session_unavailable' || message === 'input_capture_plugin_unavailable';
+    const invalid = /^invalid_input_capture_/.test(message);
+    return jsonRes(res, invalid ? 400 : conflict ? 409 : rejected ? 422 : 503, { ok: false, error: invalid || conflict || rejected ? message : 'input_capture_unavailable' });
   }
 });
 
