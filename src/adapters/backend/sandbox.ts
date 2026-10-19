@@ -147,6 +147,15 @@ export function buildCredentialOnlySandboxArgs(input: {
     // capability path must never seed a shared server's global env). Being in
     // this pane's own bwrap argv, it cannot leak to any other session.
     args.push('--setenv', 'BOTMUX_SEND_RELAY', outbox);
+    // Marks this relay as the credential-only flavour's. `botmux send` always
+    // uses it; `botmux dispatch` routes by shape (cmdDispatch): `--bot-app`
+    // forms keep the relay (the host sets up chat grants with the secret this
+    // pane cannot read), while the legacy/governed forms the relay refuses
+    // (--bot, --repo, --standby, --model, --reasoning-effort) take the direct
+    // path, which needs no masked secret here. The full sandbox never sets
+    // this, so its relay-only dispatch is unchanged; forging it there reaches a
+    // direct path that has no bot credentials to use.
+    args.push('--setenv', 'BOTMUX_SEND_RELAY_SCOPE', 'send');
   }
   args.push(
     '--unshare-user',
@@ -1310,7 +1319,15 @@ export interface RelayRequest {
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker. (`dispatch` has its own bounded allowlist below.)
-const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
+const RELAY_FLAGS_NOVAL = new Set([
+  '--mention-back',
+  '--no-mention',
+  '--no-quote',
+  '--voice',
+  '--slash',
+  '--urgent',
+  '--schedule-remove-self',
+]);
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
