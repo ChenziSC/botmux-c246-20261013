@@ -677,3 +677,26 @@ describe('durable async recipient admission', () => {
     expect(lookupStrict('s', 't')?.result.content).toBe('original');
   });
 });
+
+
+describe('frozen async result recipient', () => {
+  it.each(['completed', 'failed', 'interrupted'] as const)('retains conversation delivery after %s and a fresh read', status => {
+    recordPending('conversation', 'answer', 1000, 'cli_test', true, 'conversation');
+    recordInputCommit('conversation', 'answer', 'cli_test', 1, 1500);
+    if (status === 'completed') recordCompleted('conversation', 'answer', 'original reply', 2000, 'cli_test');
+    if (status === 'failed') recordTerminalFailureStrict('conversation', 'answer', 2000, 'cli_test', 'test_failure');
+    if (status === 'interrupted') recordInterruptedStrict('conversation', 'answer', 2000, 'cli_test');
+    const original = lookupStrict('conversation', 'answer')!.result;
+    expect(original).toMatchObject({ status, resultDelivery: 'conversation', inputCommit: { workerGeneration: 1 } });
+    const raw = JSON.parse(readFileSync(join(tempDir, 'async-triggers', 'conversation.json'), 'utf8'));
+    expect(raw.results.answer.resultDelivery).toBe('conversation');
+  });
+  it('rejects a recipient change for the same pending admission and corrupt recipients', () => {
+    recordPending('conversation', 'answer', 1000, 'cli_test', true, 'conversation');
+    expect(() => recordPending('conversation', 'answer', 1000, 'cli_test', true)).toThrow('identity_conflict');
+    const file = join(tempDir, 'async-triggers', 'conversation.json');
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    raw.results.answer.resultDelivery = 'guess'; writeFileSync(file, JSON.stringify(raw));
+    expect(() => lookupStrict('conversation', 'answer')).toThrow();
+  });
+});

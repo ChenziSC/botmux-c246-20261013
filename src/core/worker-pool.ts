@@ -14500,7 +14500,8 @@ function setupWorkerHandlers(
       const entry = serialEntry(msg)!;
       restoreDispatchRecipient(ds, entry);
       if (!entry.serialResult?.outputCommitted) {
-        if (entry.deliverySink === 'http_async') {
+        if (entry.deliverySink === 'http_async'
+          && ds.asyncTriggerResults?.get(msg.turnId)?.resultDelivery !== 'conversation') {
           // Persist through the original sink directly. Generic IM suppression,
           // stale in-memory tombstones and chat prefixes are not HTTP receipts.
           if (msg.turnFailed) commitAsyncTriggerFailure(ds, msg.turnId, Date.now(), msg.turnFailureCode || 'worker_turn_failed');
@@ -17655,7 +17656,8 @@ function setupWorkerHandlers(
           const asyncSink = !!asyncResult
             || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
           if (asyncSink) {
-            nonLarkFailureHandled = true;
+            nonLarkFailureHandled ||= asyncResult?.resultDelivery !== 'conversation'
+              || asyncResult.status === 'completed' || asyncResult.status === 'interrupted';
             rememberHttpTerminal(ds, terminalMessage.turnId);
             const failedAt = Date.now();
             if (asyncResult?.status === 'completed') {
@@ -18471,6 +18473,10 @@ function setupWorkerHandlers(
                 );
               }
               const asyncSink = preview.settledEntry.deliverySink === 'http_async';
+              const callerOnly = asyncSink
+                && ds.asyncTriggerResults?.get(msg.turnId)?.resultDelivery !== 'conversation';
+              // Capture survives an explicit publication suppression; only the
+              // conversation delivery waits for the ordinary IM acknowledgement.
               if (asyncSink && msg.disposition !== 'steer_superseded') {
                 if (msg.turnFailed) commitAsyncTriggerFailure(ds, msg.turnId, Date.now(), msg.turnFailureCode || 'worker_turn_failed');
                 else commitAsyncTriggerCompletion(ds, msg.turnId, msg.content, Date.now(), msg.usage);
@@ -18483,7 +18489,7 @@ function setupWorkerHandlers(
                   preview.ledger[0]!.turnId, Date.now(), ds.larkAppId, true);
               }
               const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
-              const owned = asyncSink || deliverySuppressed || !msg.content.trim() || alreadyDelivered
+              const owned = callerOnly || deliverySuppressed || !msg.content.trim() || alreadyDelivered
                 ? true
                 : await new Promise<boolean>(resolve => {
                     deliverFinalOutput(
@@ -19121,7 +19127,7 @@ function commitAsyncTriggerFailure(
 function commitAsyncTriggerCompletion(
   ds: DaemonSession, turnId: string, content: string, completedAt: number,
   usage?: asyncTriggerStore.PersistedAsyncTriggerResult['usage'],
-): void {
+): asyncTriggerStore.PersistedAsyncTriggerResult {
   const committed = asyncTriggerStore.recordCompleted(
     ds.session.sessionId, turnId, content, completedAt, ds.larkAppId, ...(usage ? [usage] : []),
   );
@@ -19136,6 +19142,7 @@ function commitAsyncTriggerCompletion(
     });
   }
   ds.idempotentAsyncTurns?.delete(turnId);
+  return committed;
 }
 
 function fanOutSteerGroupFinal(
@@ -19438,6 +19445,31 @@ function deliverFinalOutput(
   }
   let renderSnapshot = frozenRenderSnapshot;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
+  const conversationResult = !managedReceiver
+    && ds.asyncTriggerResults?.get(msg.turnId)?.resultDelivery === 'conversation';
+  // Capture and conversation publication have different completion facts. Keep
+  // the native result in the existing receiver, then reuse the normal IM path
+  // (original target, dedupe, retry and cancellation), never a second publisher.
+  if (conversationResult) {
+    try {
+      const original = restoreAsyncTriggerRecipient(ds, msg.turnId);
+      if (original.status === 'interrupted'
+        || (msg.turnFailed && original.status === 'completed')
+        || (!msg.turnFailed && original.status === 'failed' && original.reason === 'turn_terminal')) {
+        onComplete?.(true); return;
+      }
+      if (msg.turnFailed) {
+        if (commitAsyncTriggerFailure(ds, msg.turnId, Date.now(), msg.turnFailureCode || 'worker_turn_failed')) {
+          onComplete?.(true); return;
+        }
+      } else if (commitAsyncTriggerCompletion(ds, msg.turnId, msg.content, Date.now(), msg.usage).status !== 'completed') {
+        onComplete?.(true); return;
+      }
+    } catch (error) {
+      logger.error('Conversation result capture failed: ' + String(error));
+      onComplete?.(false); return;
+    }
+  }
   const zeroPromptReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
     && sessionPromptInjection(ds) === 'none';
   if (msg.terminalLocal) {
@@ -19457,7 +19489,7 @@ function deliverFinalOutput(
   // output, resolve the Promise immediately, and DO NOT send it to Lark.
   // Dedicated receivers are structurally pinned to their audited listener
   // action and may never be diverted into these generic host-side sinks.
-  if (!managedReceiver && ds.settledHttpTerminalTurns?.has(msg.turnId)) {
+  if (!managedReceiver && !conversationResult && ds.settledHttpTerminalTurns?.has(msg.turnId)) {
     onComplete?.(true);
     return;
   }
@@ -19465,7 +19497,7 @@ function deliverFinalOutput(
     // Older workers mark failed fallbacks without a structured provider code.
     const failureCode = msg.turnFailureCode || 'worker_turn_failed';
     const failedWait = ds.pendingWaitPromises?.get(msg.turnId);
-    const failedAsync = ds.asyncTriggerResults?.get(msg.turnId);
+    const failedAsync = conversationResult ? undefined : ds.asyncTriggerResults?.get(msg.turnId);
     if (failedAsync?.status === 'completed' || failedAsync?.status === 'interrupted') {
       rememberHttpTerminal(ds, msg.turnId);
       onComplete?.(true);
@@ -19531,7 +19563,7 @@ function deliverFinalOutput(
     return;
   }
 
-  const asyncResult = managedReceiver ? undefined : ds.asyncTriggerResults?.get(msg.turnId);
+  const asyncResult = managedReceiver || conversationResult ? undefined : ds.asyncTriggerResults?.get(msg.turnId);
   if (asyncResult) {
     // An acknowledged exact interrupt is a caller-selected terminal boundary.
     // Ctrl+C can race a final already buffered by the CLI; never resurrect that

@@ -1850,7 +1850,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     },
   );
 
-  it.each([false, true])('recovers the durable Codex App async recipient before settlement (suppressed=%s)', async suppressDelivery => {
+  it.each([false, true].flatMap(conversation => [false, true].map(suppressDelivery => ({ conversation, suppressDelivery }))))('recovers the durable Codex App async recipient (conversation=$conversation, suppressed=$suppressDelivery)', async ({ conversation, suppressDelivery }) => {
     const sessionReply = vi.fn(async () => 'om_forbidden');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
@@ -1859,7 +1859,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     ds.session.codexAppDispatchLedger = [{
       dispatchId: 'recover-d', turnId: 'recover-t', state: 'prepared', content: 'input', deliverySink: 'http_async',
     }];
-    recordAsyncPending(ds.session.sessionId, 'recover-t', Date.now(), ds.larkAppId);
+    recordAsyncPending(ds.session.sessionId, 'recover-t', Date.now(), ds.larkAppId, true, conversation ? 'conversation' : undefined);
     ds.asyncTriggerResults = undefined;
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
     (ds.worker as any).emit('message', {
@@ -1871,7 +1871,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(lookupAsyncStrict(ds.session.sessionId, 'recover-t')?.result).toMatchObject({
       status: 'completed', content: 'original result',
     });
-    expect(sessionReply).not.toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(conversation && !suppressDelivery ? 1 : 0);
+    if (conversation) expect(lookupAsyncStrict(ds.session.sessionId, 'recover-t')?.result.resultDelivery).toBe('conversation');
   });
 
   it.each([
@@ -3032,17 +3033,25 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(card).not.toContain('ou_dispatcher_bot');
     });
 
-    it('addresses the ambiguous-terminal failure card to the bot admin, not the dispatcher', async () => {
+    it.each(['ordinary', 'caller', 'conversation'] as const)('routes the %s ambiguous-terminal failure card to its actual recipient', async recipient => {
       await bindTopicToDispatcher();
       vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
       const sessionReply = vi.fn(async () => 'om_failed_card');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = dispatchedRunnerDs('dsh');
       ds.adoptedFrom = undefined;
+      if (recipient !== 'ordinary') {
+        recordAsyncPending(ds.session.sessionId, 'turn-1', Date.now(), ds.larkAppId, true,
+          recipient === 'conversation' ? 'conversation' : undefined);
+        ds.asyncTriggerResults = new Map([['turn-1', lookupAsyncStrict(ds.session.sessionId, 'turn-1')!.result as any]]);
+      }
       const { __testOnly_setupWorkerHandlers } = await import('../src/core/worker-pool.js') as any;
       __testOnly_setupWorkerHandlers(ds, ds.worker as any);
       ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'turn-1', status: 'ambiguous' });
       await vi.advanceTimersByTimeAsync(10);
+      if (recipient === 'caller') {
+        expect(sessionReply).not.toHaveBeenCalled(); return;
+      }
       expect(sessionReply).toHaveBeenCalledOnce();
       expect(JSON.parse(String(sessionReply.mock.calls[0][1]))).toEqual({ turnFailed: true, mentionOpenId: 'ou_admin_human' });
     });

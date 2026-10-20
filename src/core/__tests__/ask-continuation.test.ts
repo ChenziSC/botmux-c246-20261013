@@ -112,7 +112,8 @@ it('projects a durable delivery failure and never resubmits a previously registe
 it.each(['group', 'p2p'] as const)('preserves the source chat permission for %s continuations', async chatType => {
   answer(registerContinuationAsk({ ...input, chatType }).askId);
   await reconcileAskContinuations('app', async data => {
-    expect(continuationRequest(data).options?.allowChatMessages).toBe(chatType === 'group');
+    expect(continuationRequest(data).options).toMatchObject({ asyncReturnSessionId: true, resultDelivery: 'conversation' });
+    expect(continuationRequest(data).options?.allowChatMessages).toBeUndefined();
     return { state: 'committed' };
   });
 });

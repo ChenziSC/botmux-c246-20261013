@@ -75,6 +75,10 @@ export interface TriggerRequest {
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
+    /** Async admission and result polling do not choose the reply recipient.
+     * Conversation replies use the normal, original-session delivery pipeline.
+     * Explicit opt-in, only for an existing real conversation without steer. */
+    resultDelivery?: 'caller' | 'conversation';
     /** Permit explicit botmux send for messages authorized by this request in the
      * existing real group. The caller determines message content and timing.
      * Final output still returns to the caller. Defaults to false; turn-local.
@@ -327,6 +331,14 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (waitForFinalOutput && asyncReturnSessionId) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput and asyncReturnSessionId cannot be used together' } };
+  }
+  if (options.resultDelivery !== undefined && !['caller', 'conversation'].includes(options.resultDelivery as string)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'invalid resultDelivery' } };
+  }
+  if (options.resultDelivery === 'conversation' && (target.kind !== 'turn' || !hasSessionId
+    || !asyncReturnSessionId || waitForFinalOutput || source.type === 'headless'
+    || options.steer === true || options.suppressFinalOutput === true)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'conversation result delivery requires an existing async conversation without steer or suppression' } };
   }
   if (options.allowChatMessages !== undefined && typeof options.allowChatMessages !== 'boolean') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.allowChatMessages must be a boolean' } };

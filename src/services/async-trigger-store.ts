@@ -45,6 +45,8 @@ const validExecutionStart = (value: unknown): value is NativeExecutionStart => {
     && ['codex_transcript_start','codex_rpc_turn_start'].includes(v.proofKind);
 };
 export interface PersistedAsyncTriggerResult {
+  /** Frozen at admission; an absent value preserves historical caller-only delivery. */
+  resultDelivery?: 'conversation';
   executionStarted?: NativeExecutionStart;
   /** Receiver ACK, independent of IM reply anchors or an optional dedupe key. */
   inputCommit?: { workerGeneration: number; observedAt: number };
@@ -147,6 +149,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *  fields are likewise type-checked when present. */
 function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
   if (!isPlainObject(value)) return false;
+  if (value.resultDelivery !== undefined && value.resultDelivery !== 'conversation') return false;
   if (value.inputCommit !== undefined && (!isPlainObject(value.inputCommit)
     || !Number.isSafeInteger(value.inputCommit.workerGeneration) || Number(value.inputCommit.workerGeneration) <= 0
     || typeof value.inputCommit.observedAt !== 'number' || !Number.isFinite(value.inputCommit.observedAt)
@@ -244,7 +247,7 @@ function saveStrict(sessionId: string, file: AsyncTriggerFile): void {
  *  can be rejected fail-closed (an unstamped file would be un-attributable and
  *  therefore un-servable). Pass '' only in tests that deliberately exercise the
  *  legacy-unstamped path. */
-export function recordPending(sessionId: string, triggerId: string, createdAt: number, ownerLarkAppId: string, durable = false): void {
+export function recordPending(sessionId: string, triggerId: string, createdAt: number, ownerLarkAppId: string, durable = false, resultDelivery?: 'conversation'): void {
   const write = () => {
     const file = durable ? loadStrict(sessionId) : load(sessionId);
     if (durable) {
@@ -253,14 +256,15 @@ export function recordPending(sessionId: string, triggerId: string, createdAt: n
       }
       const prior = file.results[triggerId];
       if (prior !== undefined) {
-        if (!isValidPersistedResult(prior) || prior.status !== 'pending' || prior.createdAt !== createdAt) {
+        if (!isValidPersistedResult(prior) || prior.status !== 'pending' || prior.createdAt !== createdAt
+          || prior.resultDelivery !== resultDelivery) {
           throw new Error('async_pending_identity_conflict');
         }
         return;
       }
     }
     if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
-    file.results[triggerId] = { status: 'pending', createdAt };
+    file.results[triggerId] = { status: 'pending', createdAt, ...(resultDelivery ? { resultDelivery } : {}) };
     file.latestTriggerId = triggerId;
     if (durable) saveStrict(sessionId, file);
     else save(sessionId, file);
@@ -375,6 +379,7 @@ export function recordCompleted(
     const result: PersistedAsyncTriggerResult = {
       status: 'completed',
       createdAt: prev?.createdAt ?? completedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
       ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       ...(prev?.outputPendingTerminal ? { outputPendingTerminal: prev.outputPendingTerminal } : {}),
@@ -425,6 +430,7 @@ export function recordSteerParked(
     file.results[triggerId] = {
       status: 'pending',
       createdAt: prev?.createdAt ?? now,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
       ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       steerParkedBy: successorTurnId,
@@ -485,6 +491,7 @@ export function supersedePendingTriggerByCompletedSuccessorStrict(
     file.results[predecessorTriggerId] = {
       status: 'failed',
       createdAt: predecessor.createdAt,
+      ...(predecessor.resultDelivery ? { resultDelivery: predecessor.resultDelivery } : {}),
       ...(predecessor.inputCommit ? { inputCommit: predecessor.inputCommit } : {}),
       ...(predecessor.executionStarted ? { executionStarted: predecessor.executionStarted } : {}),
       failedAt: supersededAt,
@@ -545,6 +552,7 @@ export function recordFailedStrict(
     file.results[triggerId] = {
       status: 'failed',
       createdAt: prev?.createdAt ?? failedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
       ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       failedAt,
@@ -583,6 +591,7 @@ export function recordTerminalFailureStrict(
     file.results[triggerId] = {
       status: 'failed',
       createdAt: prev?.createdAt ?? failedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
       ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       failedAt,
@@ -619,6 +628,7 @@ export function recordInterruptedStrict(
     file.results[triggerId] = {
       status: 'interrupted',
       createdAt: prev?.createdAt ?? interruptedAt,
+      ...(prev?.resultDelivery ? { resultDelivery: prev.resultDelivery } : {}),
       ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       ...(prev?.executionStarted ? { executionStarted: prev.executionStarted } : {}),
       interruptedAt,

@@ -536,6 +536,23 @@ describe('serial native turn commit barrier', () => {
     config.session.dataDir = previousDataDir;
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
+  it.each([false, true])('restores conversation delivery and commits once (terminalFirst=%s)', async terminalFirst => {
+    const ds = serialDs();
+    durable.recordPending(ds.session.sessionId, 'serial-a', Date.now(), ds.larkAppId, false, 'conversation');
+    ds.asyncTriggerResults = undefined;
+    if (terminalFirst) emit(ds, terminal());
+    emit(ds, output());
+    if (!terminalFirst) emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds)).toHaveLength(1));
+    expect(durable.lookupStrict(ds.session.sessionId, 'serial-a')?.result).toMatchObject({
+      status: 'completed', content: 'exact result', resultDelivery: 'conversation',
+    });
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    ds.asyncTriggerResults = undefined;
+    emit(ds, output()); emit(ds, terminal());
+    await vi.waitFor(() => expect(commits(ds).length).toBeGreaterThan(1));
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+  });
   it('repairs a missing HTTP start projection from the original ledger before retiring a recovered result', async () => {
     const ds = serialDs();
     durable.recordInputCommit(ds.session.sessionId, 'serial-a', ds.larkAppId, 1);

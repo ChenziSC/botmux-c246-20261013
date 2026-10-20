@@ -816,3 +816,35 @@ describe('HTTP wait result draining after a positively observed native terminal'
     } finally { vi.useRealTimers(); }
   });
 });
+
+
+describe('frozen conversation result destination', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => ['group', 'p2p'].flatMap(chatType => [true, false].map(live => ({ cliId, chatType, live })))))(
+    'admits one $cliId $chatType answer with live=$live and retains the destination', async ({ cliId, chatType, live }) => {
+      mockGetBot.mockReturnValue({ config: { cliId, apiOnly: false } });
+      const ds = existingDs({ chatId: 'oc_real', chatType: chatType as 'group' | 'p2p', worker: live ? { killed: false, send: vi.fn() } as any : null });
+      ds.session.chatId = 'oc_real';
+      const req = followUpReq('conversation'); req.options!.resultDelivery = 'conversation';
+      const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+      expect(first.ok).toBe(true);
+      expect(asyncTriggerStore.lookupStrict(SID, first.triggerId!)!.result.resultDelivery).toBe('conversation');
+      const dispatch = live ? mockSendWorkerInput : mockForkWorker;
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(dispatch.mock.calls[0])).not.toContain('botmux_http_response_mode');
+      asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'answer', Date.now(), APP);
+      const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+      expect(repeated.ok).toBe(true); expect(repeated.idempotent).toBe(true);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      req.options!.resultDelivery = 'caller';
+      expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) })).errorCode).toBe('idempotency_conflict');
+    });
+  it.each(['virtual', 'apiOnly', 'wrong-bot', 'mismatched-chat'])('rejects unbound conversation output: %s', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: kind === 'apiOnly' } });
+    const ds = existingDs({ chatId: kind === 'virtual' ? CHAT : 'oc_real', worker: { killed: false, send: vi.fn() } as any });
+    if (kind === 'wrong-bot') ds.larkAppId = 'other';
+    const req = followUpReq('unbound'); req.options!.resultDelivery = 'conversation';
+    if (kind === 'mismatched-chat') req.target.chatId = 'oc_other';
+    expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) })).ok).toBe(false);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled(); expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+});

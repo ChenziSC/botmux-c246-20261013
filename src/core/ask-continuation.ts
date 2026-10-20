@@ -1,3 +1,4 @@
+import { t, localeForBot } from '../i18n/index.js';
 import { createHash } from 'node:crypto';
 import type { AskAnswerDelivery } from './ask-broker.js';
 import type { AskContinuation } from './ask-types.js';
@@ -12,8 +13,8 @@ export function continuationRequest(answer: AskAnswerDelivery): TriggerRequest {
       payload: { askId: answer.askId, originTurnId: answer.continuation.originTurnId,
         questions: answer.questions, answer: answer.result } },
     instruction: 'The user answered the question from this same task. Read the original question and answer in the event data and continue the original task. The answer is not proof of business completion. Do not repeat the question or duplicate effects already completed.',
-    options: { turnIdempotencyKey: key, asyncReturnSessionId: true, allowChatMessages: answer.chatType === 'group' },
-    presentation: { liveCard: 'on-start', title: 'Continue after user answer' } };
+    options: { turnIdempotencyKey: key, asyncReturnSessionId: true, resultDelivery: 'conversation' },
+    presentation: { liveCard: 'on-start', title: t('card.ask.continuation_title', {}, localeForBot(answer.larkAppId)) } };
 }
 export function createAskContinuationDispatcher(deps: {
   submit: (request: TriggerRequest) => Promise<TriggerResponse>;

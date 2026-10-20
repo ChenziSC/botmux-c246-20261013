@@ -117,7 +117,8 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
     if (instruction) {
       lines.push('', '<botmux_task trusted="true">', instruction, '</botmux_task>');
     }
-    if (req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId) {
+    if ((req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId)
+      && req.options?.resultDelivery !== 'conversation') {
       lines.push(
         '',
         '<botmux_http_response_mode trusted="true">',
@@ -138,7 +139,8 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       '</botmux_task>',
     );
   }
-  if (req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId) {
+  if ((req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId)
+    && req.options?.resultDelivery !== 'conversation') {
     if (lines.length > 0) lines.push('');
     lines.push(
       '<botmux_http_response_mode trusted="true">',
@@ -731,14 +733,15 @@ function waitForSessionFinalOutput(
   });
 }
 
-function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+function beginAsyncTrigger(ds: DaemonSession, triggerId: string, resultDelivery?: 'caller' | 'conversation'): void {
   const createdAt = Date.now();
   // The durable recipient is an admission prerequisite, not a best-effort
   // projection. Otherwise a disk failure could start work with no recoverable
   // consumer. Publish the in-memory binding only after the durable write.
-  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId, true);
+  const conversation = resultDelivery === 'conversation' ? 'conversation' as const : undefined;
+  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId, true, conversation);
   ds.asyncTriggerResults ??= new Map();
-  ds.asyncTriggerResults.set(triggerId, { status: 'pending', createdAt });
+  ds.asyncTriggerResults.set(triggerId, { status: 'pending', createdAt, ...(conversation ? { resultDelivery: conversation } : {}) });
   ds.latestAsyncTriggerId = triggerId;
 }
 
@@ -1215,6 +1218,17 @@ async function triggerSessionTurnAdmitted(
     }
   }
 
+  if (req.options?.resultDelivery === 'conversation') {
+    const bound = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
+    if (!req.options.asyncReturnSessionId || req.options.waitForFinalOutput || req.options.steer
+      || req.options.suppressFinalOutput || req.source.type === 'headless' || getBot(larkAppId).config.apiOnly
+      || !bound || bound.larkAppId !== larkAppId || !['group', 'p2p'].includes(bound.chatType)
+      || !larkTransportEnabled({ chatId: bound.chatId, apiOnly: getBot(larkAppId).config.apiOnly })
+      || (req.target.chatId && req.target.chatId !== bound.chatId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'conversation result delivery requires an existing real conversation' };
+    }
+  }
+
   // Reuse durable receipts before requiring an active group. Only a new
   // dispatch (including a reserved-lease takeover) needs a live binding.
   if (req.options?.allowChatMessages === true) {
@@ -1559,7 +1573,7 @@ async function triggerSessionTurnAdmitted(
         if (turnLease) stampTurnConvergence();
         let accepted: boolean;
         try {
-          beginAsyncTrigger(target, triggerId);
+          beginAsyncTrigger(target, triggerId, req.options?.resultDelivery);
           const dispatchAttempt = prepareStableDispatch(target, false);
           armFinalOutputSuppression(target, dispatchAttempt);
           accepted = sendWorkerInput(target, content, triggerId, {
@@ -1706,7 +1720,7 @@ async function triggerSessionTurnAdmitted(
       // fork init (mirrors the fresh-session path).
       const atMostOnce = !!(turnLeaseKey && turnLease);
       try {
-        beginAsyncTrigger(target, triggerId);
+        beginAsyncTrigger(target, triggerId, req.options?.resultDelivery);
         const dispatchAttempt = prepareStableDispatch(target, true);
         armFinalOutputSuppression(target, dispatchAttempt);
         forkWorker(target, withSteer(content), {
@@ -2222,7 +2236,7 @@ async function triggerSessionTurnAdmitted(
     // `running` forever. Write the authoritative durable failed (dispatch_unknown)
     // and close — at-most-once, never re-dispatched (finding #5b).
     try {
-      beginAsyncTrigger(newDs, triggerId);
+      beginAsyncTrigger(newDs, triggerId, req.options?.resultDelivery);
       // Stamp the idempotent-async-turn descriptor so a worker that dies with no
       // final_output converges to a durable `dispatch_unknown` instead of polling
       // `running` forever (codex #776 round-6 finding #1). Only for keyed turns:
