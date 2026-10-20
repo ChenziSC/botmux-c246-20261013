@@ -165,6 +165,20 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       '</botmux_http_response_mode>',
     );
   }
+  if (req.options?.resultDelivery === 'conversation') {
+    if (lines.length > 0) lines.push('');
+    lines.push(
+      '<botmux_conversation_response_mode trusted="true">',
+      'For this turn, Botmux delivers your final assistant output to the original conversation automatically.',
+      'Return the complete user-facing answer in your final output. This overrides session-wide instructions to send a reply yourself.',
+      ...(req.options.allowChatMessages === true ? [
+        'You may separately call botmux send only for messages authorized by this request; do not send a duplicate of the final answer.',
+      ] : ['Do not call botmux send; the host owns delivery of this reply.']),
+      'Do not include internal routing headers, transport details, or delivery instructions in the user-facing answer.',
+      'If this turn requires no reply, output ONLY BOTMUX_NOTHING_TO_SEND.',
+      '</botmux_conversation_response_mode>',
+    );
+  }
   return lines.join('\n');
 }
 
@@ -791,6 +805,7 @@ function buildExistingSessionContent(
   codexAppApplicationContext: string,
   codexAppMessageContext: string,
   turnId: string,
+  hostManagedResponse: boolean,
 ) {
   ensureSessionWhiteboard(ds);
   const botCfg = getBot(larkAppId).config;
@@ -808,6 +823,7 @@ function buildExistingSessionContent(
     // HTTP response directives are carried separately at application priority.
     codexAppMessageContext,
     sessionBackendType: ds.session.backendType,
+    hostManagedResponse,
     promptInjection: sessionPromptInjection(ds),
     turnId,
   });
@@ -1371,6 +1387,7 @@ async function triggerSessionTurnAdmitted(
     }
     const content = openingInput ?? buildExistingSessionContent(
       target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
+      !!(req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId),
     );
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
@@ -2034,6 +2051,7 @@ async function triggerSessionTurnAdmitted(
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,
+      hostManagedResponse: !!(req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId),
       // Trigger sessions are newly created above and fork without resume.
       larkToolResume: false,
     },

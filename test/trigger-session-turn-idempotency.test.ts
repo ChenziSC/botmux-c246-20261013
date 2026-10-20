@@ -97,6 +97,7 @@ import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { config } from '../src/config.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
+import { buildFollowUpCliInput } from '../src/core/session-manager.js';
 
 const APP = 'local_riff';
 const SID = 'sess_existing';
@@ -831,6 +832,8 @@ describe('frozen conversation result destination', () => {
       const dispatch = live ? mockSendWorkerInput : mockForkWorker;
       expect(dispatch).toHaveBeenCalledTimes(1);
       expect(JSON.stringify(dispatch.mock.calls[0])).not.toContain('botmux_http_response_mode');
+      expect(JSON.stringify(dispatch.mock.calls[0])).toContain('botmux_conversation_response_mode');
+      expect(buildFollowUpCliInput).toHaveBeenLastCalledWith(expect.any(String), SID, expect.objectContaining({ hostManagedResponse: true }));
       asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'answer', Date.now(), APP);
       const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
       expect(repeated.ok).toBe(true); expect(repeated.idempotent).toBe(true);
