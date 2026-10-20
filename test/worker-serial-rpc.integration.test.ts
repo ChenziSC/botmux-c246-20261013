@@ -7,6 +7,7 @@ import { once } from 'node:events';
 import { execFileSync } from 'node:child_process';
 import { expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -35,13 +36,13 @@ if (process.argv.includes('app-server')) {
 `);
   chmodSync(cli, 0o755);
   // Establish an isolated tmux socket: missing server is unknown, not a proven absent pane.
-  execFileSync('tmux', ['new-session', '-d', '-s', 'test-control'], { env: { ...process.env, TMUX_TMPDIR: root } });
+  execFileSync('tmux', ['new-session', '-d', '-s', 'test-control'], { env: privateTmuxEnv(root) });
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
   const child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'),
-    env: { ...process.env, TMUX_TMPDIR: root, SESSION_DATA_DIR: join(root, 'data'),
+    env: privateTmuxEnv(root, { SESSION_DATA_DIR: join(root, 'data'),
       BOTMUX_SESSION_ID: sessionId, BOTMUX_NO_CLAIM: '1', BOTMUX_XPI_ENABLED: 'false',
-      FAKE_NO_TURN_TERMINAL: '1', FAKE_TURN_CONFIG_FILE: turns, FAKE_ROLLOUT_PATH: join(root, 'rollout.jsonl') },
+      FAKE_NO_TURN_TERMINAL: '1', FAKE_TURN_CONFIG_FILE: turns, FAKE_ROLLOUT_PATH: join(root, 'rollout.jsonl') }),
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   child.on('message', message => messages.push(message as WorkerToDaemon));
   child.stdout?.on('data', data => logs.push(String(data)));
@@ -102,7 +103,7 @@ if (process.argv.includes('app-server')) {
       const timer = setTimeout(() => child.kill('SIGKILL'), 5_000);
       await exited; clearTimeout(timer);
     }
-    execFileSync('tmux', ['kill-server'], { env: { ...process.env, TMUX_TMPDIR: root } });
+    execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root) });
     rmSync(root, { recursive: true, force: true });
   }
 }, 50_000);
