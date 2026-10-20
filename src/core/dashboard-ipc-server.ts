@@ -456,6 +456,8 @@ import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPo
 import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
 import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn-recovery.js';
+import { projectSerialWorkerRecovery } from './worker-startup-retry.js';
+import { wakeOriginalSerialWorker } from './worker-pool.js';
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
@@ -2333,6 +2335,19 @@ ipcRoute('POST', '/api/sessions/:sessionId/wake', async (req, res, params) => {
     if (isRemoteBackendSession(ds)) {
       return jsonRes(res, 409, { ok: false, error: 'remote_wake_unsupported' });
     }
+    const serialHead = ds.session.codexAppDispatchLedger?.[0];
+    if ((!ds.worker || ds.worker.killed) && serialHead?.executionPolicy === 'serial' && serialHead.workerRecovery) {
+      if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) {
+        return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      }
+      try {
+        const accepted = wakeOriginalSerialWorker(ds);
+        return jsonRes(res, accepted ? 200 : 409, {
+          ok: accepted, sessionId: params.sessionId, woke: !!ds.worker,
+          ...(accepted ? { recovery: 'original_dispatch' } : { error: 'original_recovery_unavailable' }),
+        });
+      } catch { return jsonRes(res, 503, { ok: false, error: 'recovery_persistence_unavailable' }); }
+    }
     if (rejectProtectedSessionMutation(res, [ds])) return;
 
     const cliId = ds.session.cliId ?? 'unknown';
@@ -3580,6 +3595,13 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     closedAt: stored?.closedAt,
     requestedTriggerId: triggerId,
   });
+
+  if (resolved.state === 'running' && (!ds?.worker || ds.worker.killed)) {
+    resolved.workerRecovery = projectSerialWorkerRecovery(stored?.codexAppDispatchLedger, resolved.triggerId);
+    if (resolved.workerRecovery) resolved.message = resolved.workerRecovery.status === 'backoff'
+      ? '原任务执行进程暂不可用，正在按既定退避等待恢复；未重新提交任务。'
+      : '原任务执行进程恢复受阻；修复运行环境后唤醒原会话，继续同一任务。';
+  }
 
   // Form C: attach the read-only web-terminal URL ONLY in core-only mode, and
   // only when a LIVE worker terminal exists (workerPort bound + view capability

@@ -35,7 +35,8 @@ import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSessio
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { logger } from '../utils/logger.js';
-import type { CliTurnPayload } from '../types.js';
+import type { CliTurnPayload, Session } from '../types.js';
+import { serialDispatchOwnsRecovery } from '../utils/codex-app-dispatch-ledger.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -314,6 +315,10 @@ export function resolveIdempotencyHit(
     return { kind: 'terminal', chatId, message: 'previous dispatch was interrupted; not re-run under the same idempotency key' };
   }
   if (hit.state === 'attempting') {
+    const ownedSession = live?.larkAppId === hit.ownerLarkAppId ? live.session : sessionStore.getOwnedSession(hit.sessionId);
+    if (serialDispatchOwnsRecovery(ownedSession?.codexAppDispatchLedger, hit.triggerId)) {
+      return { kind: 'reuse', chatId, message: 'original serial dispatch retained for recovery; poll the original trigger' };
+    }
     // Ground truth for "genuinely in flight" is a LIVE WORKER, not registry
     // presence or ownerBootId. A dispatched turn holds a non-killed worker from
     // fork (synchronous, no await between register and fork) until the worker
@@ -364,7 +369,7 @@ export function resolveIdempotencyHit(
 export async function reconcileIdempotencyLeasesOnBoot(
   ownerLarkAppId: string,
   currentBootId: string,
-  getSession: (id: string) => { chatId?: string } | undefined = sessionStore.getOwnedSession,
+  getSession: (id: string) => Pick<Session, 'chatId' | 'codexAppDispatchLedger'> | undefined = sessionStore.getOwnedSession,
 ): Promise<Set<string>> {
   const now = Date.now();
   const quarantined = new Set<string>();
@@ -403,6 +408,13 @@ export async function reconcileIdempotencyLeasesOnBoot(
     // own in-flight leases.
     if (record.ownerLarkAppId !== ownerLarkAppId) continue;
     if (record.ownerBootId === currentBootId) continue;
+    if (record.state === 'attempting') {
+      const dest = asyncTriggerStore.lookupStrict(record.sessionId, record.triggerId);
+      if (dest?.ownerLarkAppId === ownerLarkAppId
+        && serialDispatchOwnsRecovery(getSession(record.sessionId)?.codexAppDispatchLedger, record.triggerId)) {
+        continue;
+      }
+    }
     // TURN leases govern a follow-up turn on a SHARED, long-lived session — NOT a
     // throwaway fresh-session. The fresh-session reconcile below quarantines +
     // closeSession(record.sessionId) to stop restore reviving an orphaned session;
@@ -453,7 +465,12 @@ export async function reconcileIdempotencyLeasesOnBoot(
       // An explicit interrupt is a successful terminal of THIS exact turn. It
       // deliberately leaves the fresh session usable, just like completed, so
       // boot reconcile must not quarantine/close it after a daemon restart.
-      if (outcome === 'completed' || outcome === 'interrupted') continue;
+      // An explicit failed native turn is terminal for that turn, not for the
+      // logical session. In particular a completed failure of the initial turn
+      // must not close accepted successors on a later daemon boot. Only the
+      // legacy unproven dispatch below owns orphan-session quarantine.
+      if (outcome === 'completed' || outcome === 'interrupted'
+        || (outcome === 'failed' && asyncRec?.result.reason === 'turn_terminal')) continue;
       if (outcome === 'failed') {
         // Already durable-failed, but a PREVIOUS boot may have crashed after
         // writing failed and before closing → always re-quarantine and re-attempt
@@ -625,6 +642,12 @@ export function convergeIdempotentAsyncTurnOnWorkerExit(
     const ownedCompleted = existing?.result.status === 'completed'
       && existing.ownerLarkAppId === turn.ownerLarkAppId;
     if (ownedCompleted) { turns.delete(triggerId); convergedAny = true; continue; }
+    if (ds.larkAppId === turn.ownerLarkAppId && existing?.ownerLarkAppId === turn.ownerLarkAppId
+      && serialDispatchOwnsRecovery(ds.session.codexAppDispatchLedger, triggerId)) {
+      // The replacement worker consumes this same persisted transaction. Keep
+      // the lease and its exact stamp instead of failing an unwritten tail.
+      continue;
+    }
     try {
       // recordFailedStrict is itself owner-proofed (throws on owner mismatch) and
       // completed-wins, so a foreign-occupied slot throws here → caught below →
@@ -660,18 +683,35 @@ function waitForSessionFinalOutput(
 ): Promise<TriggerResponse> {
   ds.pendingWaitPromises ??= new Map();
   return new Promise<TriggerResponse>((resolve) => {
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
+      if (drainTimer) clearTimeout(drainTimer);
       ds.pendingWaitPromises?.delete(triggerId);
       resolve({ ok: false, triggerId, errorCode: 'wait_timeout', error: `wait timeout after ${timeoutMs}ms` });
     }, timeoutMs);
     ds.pendingWaitPromises!.set(triggerId, {
+      completedTerminal: (nothingToSend: boolean) => {
+        const waiter = ds.pendingWaitPromises?.get(triggerId);
+        if (!waiter) return;
+        if (nothingToSend) { waiter.resolve(''); return; }
+        if (drainTimer) return;
+        drainTimer = setTimeout(() => {
+          if (ds.pendingWaitPromises?.get(triggerId) !== waiter) return;
+          clearTimeout(timer);
+          ds.pendingWaitPromises.delete(triggerId);
+          resolve({ ok: false, triggerId, errorCode: 'no_output', error: 'native execution ended but its final output could not be verified; not re-run' });
+        }, asyncTriggerStore.ASYNC_OUTPUT_DRAIN_MS);
+        drainTimer.unref?.();
+      },
       resolve: (text: string) => {
         clearTimeout(timer);
+        if (drainTimer) clearTimeout(drainTimer);
         ds.pendingWaitPromises?.delete(triggerId);
         resolve(buildCompletedResponse(text));
       },
       reject: (err: Error) => {
         clearTimeout(timer);
+        if (drainTimer) clearTimeout(drainTimer);
         ds.pendingWaitPromises?.delete(triggerId);
         resolve({ ok: false, triggerId, errorCode: 'trigger_failed', error: err.message });
       },
@@ -693,17 +733,13 @@ function waitForSessionFinalOutput(
 
 function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
   const createdAt = Date.now();
+  // The durable recipient is an admission prerequisite, not a best-effort
+  // projection. Otherwise a disk failure could start work with no recoverable
+  // consumer. Publish the in-memory binding only after the durable write.
+  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId, true);
   ds.asyncTriggerResults ??= new Map();
-  ds.asyncTriggerResults.set(triggerId, {
-    status: 'pending',
-    createdAt,
-  });
+  ds.asyncTriggerResults.set(triggerId, { status: 'pending', createdAt });
   ds.latestAsyncTriggerId = triggerId;
-  // Durably record the pending trigger so a poller can still resolve this
-  // session after a daemon restart (the in-memory Map above does not survive
-  // one). Stamp the owning bot for cross-bot isolation. Best-effort — a failed
-  // write only forfeits restart recovery.
-  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId);
 }
 
 function buildAsyncQueuedResponse(
@@ -1487,7 +1523,7 @@ async function triggerSessionTurnAdmitted(
             armFinalOutputSuppression(target, dispatchAttempt);
             const accepted = sendWorkerInput(target, content, triggerId, {
               ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-              ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+              ...(steerRequested ? { codexAppSteerable: true as const } : { queueAfterActiveTurn: true as const }),
             });
             if (!accepted) throw new Error('worker refused trigger input before acceptance');
             recordAcceptedInput();
@@ -1533,7 +1569,7 @@ async function triggerSessionTurnAdmitted(
             // after the daemon has already terminalized it (dispatch_unknown). The
             // dormant-fork branch rides atMostOnce on the fork init instead.
             ...(turnLease ? { atMostOnce: true } : {}),
-            ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+            ...(steerRequested ? { codexAppSteerable: true as const } : { queueAfterActiveTurn: true as const }),
           });
         } catch (err) {
           // A throw AFTER the barrier (begin/prepare/arm/send). Nothing is proven
@@ -1589,7 +1625,7 @@ async function triggerSessionTurnAdmitted(
       const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
-        ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+        ...(steerRequested ? { codexAppSteerable: true as const } : { queueAfterActiveTurn: true as const }),
       });
       if (!accepted) {
         disarmLoudFinalSuppression(target);

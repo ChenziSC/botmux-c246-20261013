@@ -52,6 +52,7 @@ function harness() {
       nativeSessionTitle: 'Old title', nativeSessionTitlePrompt: 'rename instructions',
     },
     remoteThreadId: undefined,
+    codexRpcEngine: undefined,
     codexAutoUpgrade: undefined,
     cliRestartInProgress: false,
     replacementSpawnInProgress: false,
@@ -501,14 +502,18 @@ describe('worker Codex session automatic upgrade', () => {
     expect(h.state.flushPendingInjections).not.toHaveBeenCalled();
   });
 
-  it('restores RPC ownership and plugin generation before spawning the original thread viewer', async () => {
+  it.each([undefined, {
+    threadId, rolloutPath: '/runtime/original.jsonl', model: 'fixture-model',
+    modelProvider: 'fixture-provider', reasoningEffort: 'high', nativeScopeId: 'original-scope',
+  }])('restores RPC ownership and its startup runtime before spawning the original viewer: %j', async startupRuntime => {
     const h = harness();
+    h.state.codexRpcEngine = startupRuntime ? { activeThreadRuntime: startupRuntime } : undefined;
     h.state.codexRpcEligible.mockReturnValue(true);
     const done = h.run();
     await settleMicrotasks();
     expect(h.state.engageCodexRpc).toHaveBeenCalledWith(expect.objectContaining({
       cliSessionId: threadId, resume: true, prompt: '', forkSession: false,
-    }));
+    }), startupRuntime);
     expect(h.steps.indexOf('plugins')).toBeLessThan(h.steps.indexOf('rpc resume'));
     expect(h.steps.indexOf('rpc resume')).toBeLessThan(h.steps.indexOf('spawn'));
     expect(h.state.spawnCli).toHaveBeenCalledWith(expect.anything(), { pluginGenerationPrepared: true });

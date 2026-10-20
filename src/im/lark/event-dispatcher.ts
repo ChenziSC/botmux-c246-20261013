@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { isNonExecutingBotNotice } from './bot-notice.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
@@ -3294,6 +3295,16 @@ async function pollMessageListenersOnce(
       if (signal?.aborted) return;
       if (!match) continue;
 
+      try {
+        if (await isNonExecutingBotNotice(data, id => getMessageDetail(larkAppId, id, {
+          userCardContent: true, timeoutMs: MESSAGE_LISTENER_CHAT_REQUEST_TIMEOUT_MS, signal,
+        }))) continue;
+      } catch (err) {
+        logger.warn(`[message-listener:${larkAppId}] card classification unavailable; deferring ${messageId}: ${err}`);
+        continue;
+      }
+      if (signal?.aborted) return;
+
       await dispatchPolledMessageListenerMatch({
         larkAppId,
         handlers,
@@ -4649,6 +4660,7 @@ export function createLarkEventDispatcherRuntime(
     data: any,
     seedRoutingGate?: { ready: Promise<void>; complete: () => void },
     primary?: PrimaryProcessContext,
+    botCardAdmission?: () => boolean,
   ): Promise<DurableLarkCanonicalHandlerResult | void> {
     try {
       const message = data.message;
@@ -4761,6 +4773,11 @@ export function createLarkEventDispatcherRuntime(
           logger.debug(`[${larkAppId}] hall bot message swallowed after learning (chat=${chatId.substring(0, 12)})`);
           return;
         }
+        const isNotice = await isNonExecutingBotNotice(data, id => getMessageDetail(larkAppId, id, { userCardContent: true }));
+        // Legacy WS has no durable Inbox. Claim only after authoritative card
+        // classification, and reject its SDK callback if that read fails.
+        if (botCardAdmission && !botCardAdmission()) return;
+        if (isNotice) return { kind: 'ignored', reason: 'non-executing bot notification' };
         const botMessageListener = chatType === 'group'
           ? await evaluateMessageListenerWithDocumentTitles({
               bot: getBot(larkAppId),
@@ -5761,7 +5778,7 @@ export function createLarkEventDispatcherRuntime(
         .catch(err => logger.error(`Error handling message event: ${err}`));
     } catch (err) {
       logger.error(`Error handling message event: ${err}`);
-      if (primary) throw err;
+      if (primary || botCardAdmission) throw err;
     } finally {
       seedRoutingGate?.complete();
     }
@@ -5977,6 +5994,9 @@ export function createLarkEventDispatcherRuntime(
     return ack;
   };
 
+  // Coalesce a re-push while card classification is in flight. All copies
+  // receive the same ACK/rejection; a duplicate must not ACK a failed read.
+  const botCardAdmissions = new Map<string, Promise<void>>();
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
     // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
@@ -6176,6 +6196,29 @@ export function createLarkEventDispatcherRuntime(
           partitionKey: ingressAnchor,
           data,
         })).then(() => undefined);
+      }
+      const botCard = ['app', 'bot'].includes(data.sender?.sender_type)
+        && ['interactive', 'nonsupport'].includes(rawMessage?.message_type ?? rawMessage?.msg_type);
+      if (botCard) {
+        const existing = botCardAdmissions.get(eventKey);
+        if (existing) return existing;
+        let resolve!: () => void, reject!: (error: unknown) => void;
+        const receipt = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+        botCardAdmissions.set(eventKey, receipt);
+        let claimed: boolean | undefined;
+        const admit = (): boolean => {
+          if (claimed === undefined) claimed = claim();
+          resolve();
+          return claimed;
+        };
+        // Keep the synchronous setImmediate ordering shared with ordinary
+        // messages. Only this card's ACK waits for classification, not routing,
+        // worker execution or any user response.
+        scheduleAckSafeEvent(eventKey, () => serializeByAnchor(
+          ingressAnchor, () => processMessageEvent(data, undefined, undefined, admit),
+        ).then(() => { admit(); }, error => { reject(error); throw error; }),
+        'bot card event', () => true);
+        return receipt.finally(() => { botCardAdmissions.delete(eventKey); });
       }
       let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
       // Reserve the app/chat ingress lane before any routing await. Canonical

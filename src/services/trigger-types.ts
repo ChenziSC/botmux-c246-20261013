@@ -159,6 +159,17 @@ export interface TriggerResponse {
   /** Four-state async lifecycle. Present on trigger-result (async polling)
    *  responses; absent on synchronous turn/workflow dispatch responses. */
   state?: AsyncTriggerState;
+  /** Host recovery is independent of model execution; no worker means the
+   * original pending input is waiting, not actively running the model. */
+  workerRecovery?: {
+    status: 'backoff' | 'blocked';
+    attempts: number;
+    maxAttempts: number;
+    nextRetryAt?: string;
+    reason: string;
+    blockedByTurnId: string;
+    recoveryAction: 'wait_for_original_worker' | 'repair_backend_and_wake_original_session';
+  };
   /** ISO8601 completion/termination time. Present on completed/failed states. */
   finishedAt?: string;
   target?: {

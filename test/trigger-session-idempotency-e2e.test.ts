@@ -11,7 +11,7 @@
  * Run:  pnpm vitest run test/trigger-session-idempotency-e2e.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
@@ -327,7 +327,16 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     const gen = ds.idempotentAsyncTurns.get(first.triggerId!).workerGeneration;
     // Foreign bot writes a completed on OUR sessionId/triggerId (adversarial /
     // sessionId collision). ownerLarkAppId != our APP.
-    asyncTriggerStore.recordCompleted(sid, first.triggerId!, 'B answer', 100, 'cli_OTHER_BOT');
+    expect(() => asyncTriggerStore.recordCompleted(sid, first.triggerId!, 'B answer', 100, 'cli_OTHER_BOT'))
+      .toThrow('async_completion_owner_mismatch');
+    // Model pre-existing corrupt/legacy data directly. The public writer now
+    // correctly refuses to create cross-owner data, but the read/convergence
+    // path must still defend against an already contaminated file.
+    const resultFile = join(tempDir, 'async-triggers', sid + '.json');
+    const poisoned = JSON.parse(readFileSync(resultFile, 'utf8'));
+    poisoned.ownerLarkAppId = 'cli_OTHER_BOT';
+    poisoned.results[first.triggerId!] = { status: 'completed', content: 'B answer', createdAt: 100, completedAt: 100 };
+    writeFileSync(resultFile, JSON.stringify(poisoned));
     ds.worker = null;
     convergeIdempotentAsyncTurnOnWorkerExit(ds, gen);
     // The foreign completed did NOT count as our completion: convergence attempted
@@ -533,5 +542,54 @@ it('checks the requested workspace before first and subsequent routed dispatch',
   req.options!.turnIdempotencyKey='second';
   const rejected=await triggerSessionTurn(req,{larkAppId:APP,activeSessions:active});
   expect(rejected).toMatchObject({ok:false,errorCode:'bad_request',error:'target session working directory changed'});
+  expect(mockForkWorker).toHaveBeenCalledTimes(1);
+});
+
+it.each(['accepted', 'prepared'] as const)('preserves a %s serial request at exit and boot without a second admission', async state => {
+  const activeSessions = new Map<string, any>();
+  const first = await triggerSessionTurn(freshAsyncReq('serial-recovery'), { larkAppId: APP, activeSessions });
+  const ds = [...activeSessions.values()][0];
+  const triggerId = first.triggerId!;
+  ds.session.codexAppDispatchLedger = [{ dispatchId: 'serial-dispatch', turnId: triggerId,
+    content: 'frozen original', state, executionPolicy: 'serial', origin: { atMostOnce: true },
+    ...(state === 'prepared' ? { serialRecovery: { markTimeMs: Date.now(), fingerprint: 'frozen original' } } : {}),
+  }];
+  const generation = ds.idempotentAsyncTurns.get(triggerId).workerGeneration;
+  expect(convergeIdempotentAsyncTurnOnWorkerExit(ds, generation)).toBe('noop');
+  expect(asyncTriggerStore.lookup(ds.session.sessionId, triggerId)?.result.status).toBe('pending');
+  const { reconcileIdempotencyLeasesOnBoot } = await import('../src/core/trigger-session.js');
+  const quarantined = await reconcileIdempotencyLeasesOnBoot(APP, 'next-boot', () => ds.session);
+  expect(quarantined.size).toBe(0);
+  expect(mockCloseSession).not.toHaveBeenCalled();
+  const retry = await triggerSessionTurn(freshAsyncReq('serial-recovery'), { larkAppId: APP, activeSessions });
+  expect(retry.idempotent).toBe(true);
+  expect(mockForkWorker).toHaveBeenCalledTimes(1);
+  expect(asyncTriggerStore.lookup(ds.session.sessionId, triggerId)?.result.status).toBe('pending');
+});
+
+
+it.each([false, true])('keeps a native-terminal initial failure across boots (successor: %s)', async successor => {
+  const activeSessions = new Map<string, any>();
+  const first = await triggerSessionTurn(freshAsyncReq('terminal-initial'), { larkAppId: APP, activeSessions });
+  const ds = [...activeSessions.values()][0];
+  const sessionId = ds.session.sessionId;
+  asyncTriggerStore.recordTerminalFailureStrict(sessionId, first.triggerId!, Date.now(), APP, 'serial_backing_exited');
+  const original = asyncTriggerStore.lookup(sessionId, first.triggerId!)!.result;
+  if (successor) {
+    ds.session.codexAppDispatchLedger = [{ dispatchId: 'next-dispatch', turnId: 'next-turn',
+      content: 'original successor', state: 'accepted', executionPolicy: 'serial', origin: { atMostOnce: true },
+      workerRecovery: { attempts: 3, status: 'blocked', nextRetryAt: 0, reason: 'worker_recovery_exhausted' },
+    }];
+  }
+  const ledger = JSON.stringify(ds.session.codexAppDispatchLedger);
+  const { reconcileIdempotencyLeasesOnBoot } = await import('../src/core/trigger-session.js');
+  for (const boot of ['next-boot', 'another-boot']) {
+    expect((await reconcileIdempotencyLeasesOnBoot(APP, boot, () => ds.session)).size).toBe(0);
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(asyncTriggerStore.lookup(sessionId, first.triggerId!)!.result).toEqual(original);
+    expect(JSON.stringify(ds.session.codexAppDispatchLedger)).toBe(ledger);
+  }
+  const repeat = await triggerSessionTurn(freshAsyncReq('terminal-initial'), { larkAppId: APP, activeSessions });
+  expect(repeat.triggerId).toBe(first.triggerId);
   expect(mockForkWorker).toHaveBeenCalledTimes(1);
 });

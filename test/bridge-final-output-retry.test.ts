@@ -153,6 +153,7 @@ import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hook
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
+import { recordPending as recordAsyncPending, lookupStrict as lookupAsyncStrict } from '../src/services/async-trigger-store.js';
 import { homedir, tmpdir } from 'node:os';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -1788,17 +1789,42 @@ describe('Bridge final_output delivery (P2 retry)', () => {
         },
       } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
 
-      await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+      if (deliverySink !== 'http_async') await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
       expect(sessionReply).not.toHaveBeenCalled();
       await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'codex_app_dispatch_persisted',
           requestId: `settle-${deliverySink}`,
-          ok: true,
+          ok: deliverySink !== 'http_async',
         }),
       ));
+      if (deliverySink === 'http_async') expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
     },
   );
+
+  it.each([false, true])('recovers the durable Codex App async recipient before settlement (suppressed=%s)', async suppressDelivery => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'recover-d', turnId: 'recover-t', state: 'prepared', content: 'input', deliverySink: 'http_async',
+    }];
+    recordAsyncPending(ds.session.sessionId, 'recover-t', Date.now(), ds.larkAppId);
+    ds.asyncTriggerResults = undefined;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, content: 'original result', lastUuid: 'recover-output',
+      turnId: 'recover-t', suppressDelivery,
+      codexAppSettlement: { requestId: 'recover-s', generation: 'recover-g', seq: 1, dispatchId: 'recover-d' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+    expect(lookupAsyncStrict(ds.session.sessionId, 'recover-t')?.result).toMatchObject({
+      status: 'completed', content: 'original result',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
 
   it.each([
     { name: 'non-steerable head', steerable: false, sink: 'lark' as const },
@@ -2041,6 +2067,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       { dispatchId: 'd-http-grp-1', turnId: 'turn-http-grp-1', state: 'prepared', content: '', deliverySink: 'http_async', codexAppSteerable: true },
       { dispatchId: 'd-http-grp-2', turnId: 'turn-http-grp-2', state: 'accepted', content: 'merged answer', deliverySink: 'http_async', codexAppSteerable: true },
     ];
+    for (const [turnId, result] of ds.asyncTriggerResults!) {
+      recordAsyncPending(ds.session.sessionId, turnId, result.createdAt, ds.larkAppId);
+    }
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     // Member 1: superseded — ACK true, ledger pops, parked for fan-out, no Lark.
@@ -2161,6 +2190,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       { dispatchId: 'd-prune-1', turnId: 'turn-prune-1', state: 'prepared', content: '', deliverySink: 'http_async', codexAppSteerable: true },
       { dispatchId: 'd-prune-2', turnId: 'turn-prune-2', state: 'accepted', content: 'merged answer', deliverySink: 'http_async', codexAppSteerable: true },
     ];
+    for (const [turnId, result] of ds.asyncTriggerResults!) {
+      recordAsyncPending(ds.session.sessionId, turnId, result.createdAt, ds.larkAppId);
+    }
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     // Member 1 settles superseded → parked for fan-out.

@@ -791,3 +791,28 @@ describe('completed turn retry after session leaves active map', () => {
     expect(mockForkWorker).not.toHaveBeenCalled();
   });
 });
+
+
+describe('HTTP wait result draining after a positively observed native terminal', () => {
+  it.each(['empty', 'late-final', 'missing-final'] as const)('%s preserves the exact waiter and never re-dispatches', async mode => {
+    vi.useFakeTimers();
+    try {
+      const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+      const req = followUpReq(undefined); req.options = { waitForFinalOutput: true };
+      const pending = triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+      await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+      const waiter = [...ds.pendingWaitPromises!.values()][0];
+      expect(waiter.completedTerminal).toBeTypeOf('function');
+      waiter.completedTerminal!(mode === 'empty');
+      if (mode === 'late-final') waiter.resolve('original final');
+      await vi.advanceTimersByTimeAsync(30_001);
+      const result = await pending;
+      expect(result.ok).toBe(mode !== 'missing-final');
+      if (mode === 'empty') expect(result.output?.content).toBe('');
+      if (mode === 'late-final') expect(result.output?.content).toBe('original final');
+      if (mode === 'missing-final') expect(result.errorCode).toBe('no_output');
+      expect(ds.pendingWaitPromises?.size).toBe(0);
+      expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+});

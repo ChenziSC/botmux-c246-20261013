@@ -20,10 +20,19 @@ function readRegistration(ownerLarkAppId: string, target: string | Route, key: s
     const identity = route ? { target: route } : { sessionId: target };
     // Forgotten, foreign, and missing records never prove non-execution.
     if (!record) return { status: 200, body: { ok: true, schemaVersion: 1, larkAppId: ownerLarkAppId, state: 'unknown', ...identity } };
-    if (record.kind !== kind || (!route && record.sessionId !== target)) throw Error('identity mismatch');
+    if (record.ownerLarkAppId !== ownerLarkAppId || record.kind !== kind || (!route && record.sessionId !== target)) throw Error('identity mismatch');
     const sessionId = record.sessionId;
     const persisted = asyncTriggerStore.lookupStrict(sessionId, record.triggerId);
     const result = persisted?.ownerLarkAppId === ownerLarkAppId ? persisted.result : undefined;
+    // The receiver-owned async record survives worker/daemon replacement. A
+    // queued successor may receive its first input ACK only after that restart,
+    // when the old process-local idempotency binding is no longer present.
+    // Read its original durable ACK rather than requiring a second mirror write.
+    if (result?.inputCommit && record.inputCommit
+      && result.inputCommit.workerGeneration !== record.inputCommit.workerGeneration) {
+      throw Error('original_input_commit_conflict');
+    }
+    const inputCommit = record.state === 'attempting' ? result?.inputCommit ?? record.inputCommit : undefined;
     return {
       status: 200,
       body: {
@@ -33,7 +42,8 @@ function readRegistration(ownerLarkAppId: string, target: string | Route, key: s
           ownerBootId: record.ownerBootId, revision: record.revision,
           createdAt: record.createdAt, updatedAt: record.updatedAt,
         },
-        inputCommitted: record.inputCommit ? { state: 'observed', ...record.inputCommit } : { state: 'unknown' },
+        inputCommitted: inputCommit ? { state: 'observed', ...inputCommit } : { state: 'unknown' },
+        executionStarted: result?.executionStarted ? {state:'observed',...result.executionStarted} : {state:'unknown'},
         result: result ? {
           state: result.status,
           ...(result.completedAt !== undefined ? { completedAt: result.completedAt } : {}),

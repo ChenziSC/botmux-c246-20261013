@@ -539,6 +539,7 @@ import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { reconcileSerialWorkerReceipts } from './core/worker-pool.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
   SessionOwnerReminderController,
@@ -29138,6 +29139,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // bot's activeSessions map, so the configured limit is per bot.
   let liveSessionCapSweepPending = false;
   const enforceLiveSessionCap = (source: 'session_change' | 'periodic'): void => {
+    // Receipt recovery must run even when the resource cap needs no action.
+    for (const ds of activeSessions.values()) reconcileSerialWorkerReceipts(ds);
     // Coalesce spawn/idle/timer bursts.  The detached mutation evaluates the
     // current map and current config only after every admitted turn has drained,
     // so one pending sweep subsumes all triggers that arrive before it runs.
@@ -29333,6 +29336,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
     async onTurnTerminal(ds, terminal, context) {
+      // A native terminal may release several independent admission lanes.
+      // Persist the common fact FIRST, including API-only bots. The bounded
+      // queue yields on SQLite contention; enqueueing alone is not a commit.
+      const receipt = await enqueueTurnTerminal({
+        dataDir: config.session.dataDir,
+        botAppId: ds.larkAppId,
+        sessionId: ds.session.sessionId,
+        terminal,
+        onError: error => logger.error(
+          '[turn-completion] persistence failed: '
+          + (error instanceof Error ? error.message : String(error)),
+        ),
+      });
+      if (!receipt.persisted) throw receipt.error;
+      if (ds.session.workerGeneration !== context.workerGeneration) {
+        throw new Error('turn_terminal_worker_replaced_during_commit');
+      }
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native
@@ -29372,36 +29392,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         queueMicrotask(() => {
           void confirmNextCrossPrincipalSuggestion(ds);
           void driveCrossPrincipalInterruptions(ds);
-        });
-      }
-      // Feedback turn-completion persistence is a synchronous node:sqlite write.
-      // Route it through the nonblocking, tracked retry queue so a cross-process
-      // write-lock (a `botmux send --response-kind final` subprocess) can never
-      // stall the daemon event loop up to busy_timeout — the queue fails fast on
-      // contention and retries on a timer that yields the loop. apiOnly bots
-      // never produce a feedback delivery, so skip them outright; everyone else
-      // enqueues (a hosted-team may have enabled feedback with no bot-level
-      // config, so we must not gate on bot config alone).
-      if (!getBot(ds.larkAppId).config.apiOnly) {
-        void enqueueTurnTerminal({
-          dataDir: config.session.dataDir,
-          botAppId: ds.larkAppId,
-          sessionId: ds.session.sessionId,
-          terminal: {
-            turnId: terminal.turnId,
-            dispatchAttempt: terminal.dispatchAttempt,
-            status: terminal.status,
-            // Carry the worker's real completion instant and native execution
-            // span. Without these the store can only stamp its own write time
-            // and leave duration NULL, which is what made recorded "completion
-            // time" unusable for measuring how long a turn actually took.
-            ...(terminal.completedAtMs !== undefined ? { completedAtMs: terminal.completedAtMs } : {}),
-            ...(terminal.durationMs !== undefined ? { durationMs: terminal.durationMs } : {}),
-          },
-          onError: error => logger.error(
-            `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
-            + `${error instanceof Error ? error.message : String(error)}`,
-          ),
         });
       }
       // Record the failed/interrupted turn for /retry. Best-effort: a persist
