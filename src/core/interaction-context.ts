@@ -47,6 +47,33 @@ export function observeInteractionContext(
   } } };
 }
 
+/** Optional source identity readback, using the original session's p2p/group
+ * policy. It does not require the App to join a future destination group. */
+export async function observeInteractionContextWithPrincipal(
+  request: Parameters<typeof observeInteractionContext>[0],
+  deps: InteractionContextDependencies & { resolveUnionId(openId: string): Promise<string | null> },
+): Promise<InteractionContextResult> {
+  const observed = observeInteractionContext(request, deps);
+  if (observed.status !== 200) return observed;
+  const body = request.body as { resolvePrincipal?: unknown };
+  if (body.resolvePrincipal !== undefined && typeof body.resolvePrincipal !== 'boolean')
+    return { status: 400, body: { ok: false, error: 'invalid_interaction_identity' } };
+  const context = observed.body.context as Record<string, unknown>;
+  if (body.resolvePrincipal !== true || context.canTalk !== true) return observed;
+  const openId = context.actorOpenId as string;
+  const unionId = await deps.resolveUnionId(openId);
+  const current = observeInteractionContext(request, deps);
+  const authority = (value: Record<string, unknown>) => {
+    const { observedAt: _at, ...rest } = value; return JSON.stringify(rest);
+  };
+  if (current.status !== 200 || authority(current.body.context as Record<string, unknown>) !== authority(context))
+    return { status: 409, body: { ok: false, error: 'interaction_context_changed' } };
+  return { ...current, body: { ...current.body, context: { ...(current.body.context as Record<string, unknown>),
+    actorPrincipal: unionId && /^on_[A-Za-z0-9_-]{1,197}$/.test(unionId)
+      ? { kind: 'union', unionId } : { kind: 'app_open', larkAppId: request.daemonAppId, openId },
+  } } };
+}
+
 /** Host group context is an existing configured IM scope, never a Worker or an
  * execution grant. Its lifetime is independent of individual conversation turns. */
 export function configuredGroupContext(appId:string,id:string,configured:(chatId:string)=>boolean) {

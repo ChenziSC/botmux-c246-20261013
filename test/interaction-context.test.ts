@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { observeInteractionContext, configuredGroupContext, type InteractionSession } from '../src/core/interaction-context.js';
+import { observeInteractionContext, observeInteractionContextWithPrincipal, configuredGroupContext, type InteractionSession } from '../src/core/interaction-context.js';
 import { parseInteractionContextCommand } from '../src/cli/interaction-context.js';
 const session: InteractionSession = { sessionId: 's1', larkAppId: 'app1', status: 'active', chatId: 'oc_chat',
   scope: 'thread', rootMessageId: 'om_root', ownerOpenId: 'ou_owner', chatType: 'group' };
@@ -96,4 +96,52 @@ it('uses only configured real group scopes without inventing a Worker owner', ()
  const query={trustedHost:true,daemonAppId:'app1',sessionId:'chat:oc_configured',body:{larkAppId:'app1',actorOpenId:'ou_member'}};
  expect(observeInteractionContext(query,{findActive:()=>group,canTalk:()=>true}).body.context).toMatchObject({ownerOpenId:null,actorOpenId:'ou_member',canTalk:true});
  expect(observeInteractionContext(query,{findActive:()=>group,canTalk:()=>false}).body.context).toMatchObject({canTalk:false});
+});
+
+
+describe('optional source principal bound to native origin', () => {
+  it.each(['p2p', 'group'])('uses the %s policy without any destination membership lookup', async chatType => {
+    const current={...session,chatType,scope:'chat'};
+    const resolveUnionId=vi.fn(async ()=>'on_owner'),canTalk=vi.fn(()=>true);
+    const result=await observeInteractionContextWithPrincipal({...request,body:{...request.body,resolvePrincipal:true}},
+      {findActive:()=>current,canTalk,resolveUnionId});
+    expect(result.status).toBe(200);
+    expect(result.body.context).toMatchObject({actorPrincipal:{kind:'union',unionId:'on_owner'}});
+    expect(resolveUnionId).toHaveBeenCalledExactlyOnceWith('ou_owner');
+    expect(canTalk).toHaveBeenCalledWith('app1','oc_chat','ou_owner',chatType);
+  });
+  it('leaves ordinary context reads independent of contact lookup',async()=>{
+    const resolveUnionId=vi.fn(async()=>{throw Error('offline');});
+    expect((await observeInteractionContextWithPrincipal(request,{findActive:()=>session,canTalk:()=>true,resolveUnionId})).status).toBe(200);
+    expect(resolveUnionId).not.toHaveBeenCalled();
+  });
+  it('never looks up a principal when host or talk permission is denied',async()=>{
+    const resolveUnionId=vi.fn(async()=>'on_owner');
+    for(const trustedHost of [true,false])await observeInteractionContextWithPrincipal({...request,trustedHost,body:{...request.body,resolvePrincipal:true}},
+      {findActive:()=>session,canTalk:()=>false,resolveUnionId});
+    expect(resolveUnionId).not.toHaveBeenCalled();
+  });
+  it('keeps an unresolved principal App-local',async()=>{
+    const result=await observeInteractionContextWithPrincipal({...request,body:{...request.body,resolvePrincipal:true}},
+      {findActive:()=>session,canTalk:()=>true,resolveUnionId:async()=>null});
+    expect(result.body.context).toMatchObject({actorPrincipal:{kind:'app_open',larkAppId:'app1',openId:'ou_owner'}});
+  });
+  it.each(['permission','session'])('rejects %s changes while contact identity is being read',async change=>{
+    let active:InteractionSession|undefined={...session},allowed=true;
+    const result=await observeInteractionContextWithPrincipal({...request,body:{...request.body,resolvePrincipal:true}},
+      {findActive:()=>active,canTalk:()=>allowed,resolveUnionId:async()=>{if(change==='session')active=undefined;else allowed=false;return 'on_owner';}});
+    expect(result).toEqual({status:409,body:{ok:false,error:'interaction_context_changed'}});
+  });
+  it('resolves an explicit actor in an ownerless group without assigning ownership',async()=>{
+    const group={...session,scope:'chat',ownerOpenId:undefined};
+    const result=await observeInteractionContextWithPrincipal({...request,body:{...request.body,resolvePrincipal:true}},
+      {findActive:()=>group,canTalk:()=>true,resolveUnionId:async()=>'on_owner'});
+    expect(result.body.context).toMatchObject({ownerOpenId:null,actorOpenId:'ou_owner',actorPrincipal:{kind:'union',unionId:'on_owner'}});
+    expect(group.ownerOpenId).toBeUndefined();
+  });
+  it('parses the optional flag and rejects duplicates',()=>{
+    const parsed=parseInteractionContextCommand(['--principal','--bot','app1','--session','s1','--actor','ou_owner']);
+    expect(JSON.parse(parsed.init.body)).toEqual({larkAppId:'app1',actorOpenId:'ou_owner',resolvePrincipal:true});
+    expect(()=>parseInteractionContextCommand(['--principal','--principal','--bot','app1','--session','s1'])).toThrow();
+  });
 });

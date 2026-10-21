@@ -1620,16 +1620,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/interaction-context', async (req, res
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   const body = await readJsonBodyOrBadJson<unknown>(req, res);
   if (body === BAD_JSON) return;
-  const { observeInteractionContext,configuredGroupContext } = await import('./interaction-context.js');
+  const { observeInteractionContextWithPrincipal,configuredGroupContext } = await import('./interaction-context.js');
   const { evaluateAskAnswerTalk } = await import('../im/lark/event-dispatcher.js');
   try {
-    const result = observeInteractionContext({ trustedHost: true, daemonAppId: cachedLarkAppId, sessionId: params.sessionId, body }, {
+    const result = await observeInteractionContextWithPrincipal({ trustedHost: true, daemonAppId: cachedLarkAppId, sessionId: params.sessionId, body }, {
       findActive(id) {
         const group=configuredGroupContext(cachedLarkAppId,id,chatId=>!!getBot(cachedLarkAppId).config.oncallChats?.some(c=>c.chatId===chatId));
         if(group)return group;
         const ds = findActiveBySessionId(id);
         return ds ? { ...ds.session, larkAppId: ds.larkAppId, chatType: ds.chatType } : undefined;
       },
+      resolveUnionId: openId => resolveUnionIdFromOpenId(cachedLarkAppId, openId),
       canTalk: evaluateAskAnswerTalk,
     });
     return jsonRes(res, result.status, result.body);

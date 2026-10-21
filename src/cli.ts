@@ -7010,7 +7010,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   ask-fact --bot <appId> --session <id> --request <id> --ask <id>  宿主回读原生持久问题原件
   interaction-actor --bot <appId> --chat <chatId> --open <openId> | --union <unionId>
               宿主只读解析目标 App 用户身份并检查当前群成员和发言权限
-  interaction-context --bot <appId> --session <id> [--actor <openId>]
+  interaction-context --bot <appId> --session <id> [--actor <openId>] [--principal]
               宿主只读查询真实会话来源及当前回答权限（不恢复会话）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
